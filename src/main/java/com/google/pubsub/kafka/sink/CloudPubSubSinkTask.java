@@ -39,8 +39,10 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -180,7 +182,19 @@ public class CloudPubSubSinkTask extends SinkTask {
         }
       }
       if (includeHeaders) {
+        // A header never replaces an attribute set from the record's value, key or metadata.
+        Set<String> recordAttributes = new HashSet<>(attributes.keySet());
         for (Header header : getRecordHeaders(record)) {
+          if (header.value() == null) {
+            continue;
+          }
+          if (recordAttributes.contains(header.key())) {
+            log.debug(
+                "Not publishing header {} as an attribute because the message already has an"
+                    + " attribute with that name",
+                header.key());
+            continue;
+          }
           attributes.put(header.key(), header.value().toString());
         }
       }

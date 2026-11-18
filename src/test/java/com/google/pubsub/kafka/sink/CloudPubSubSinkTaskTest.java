@@ -1005,4 +1005,56 @@ public class CloudPubSubSinkTaskTest {
     ArgumentCaptor<PubsubMessage> captor = ArgumentCaptor.forClass(PubsubMessage.class);
     verify(publisher).publish(captor.capture());
     return captor.getValue();
-  }}
+  }
+
+  @Test
+  public void testHeadersDoNotReplaceAttributes() {
+    props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS, "true");
+    props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_METADATA, "true");
+    task.start(props);
+    SinkRecord record = record(4, 1000, KAFKA_MESSAGE_KEY1, "a");
+    record.headers().addString(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, "fromHeader");
+    record.headers().addString(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE, "fromHeader");
+    record.headers().addString("myHeader", "myValue");
+    task.put(Collections.singletonList(record));
+    ArgumentCaptor<PubsubMessage> captor = ArgumentCaptor.forClass(PubsubMessage.class);
+    verify(publisher).publish(captor.capture());
+    Map<String, String> attributes = captor.getValue().getAttributesMap();
+    assertEquals(KAFKA_MESSAGE_KEY1, attributes.get(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE));
+    assertEquals(KAFKA_TOPIC, attributes.get(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE));
+    assertEquals("myValue", attributes.get("myHeader"));
+  }
+
+  @Test
+  public void testNullHeaderValueIsSkipped() {
+    props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS, "true");
+    task.start(props);
+    SinkRecord record = record(0, 1, null, "a");
+    record.headers().addString("empty", null);
+    record.headers().addString("myHeader", "myValue");
+    task.put(Collections.singletonList(record));
+    verify(publisher)
+        .publish(message("a").toBuilder().putAttributes("myHeader", "myValue").build());
+  }
+
+  @Test
+  public void testHeadersDoNotReplaceFieldAttributes() {
+    props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS, "true");
+    task.start(props);
+    Schema schema = SchemaBuilder.struct().field("id", SchemaBuilder.int32()).build();
+    SinkRecord record =
+        new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, new Struct(schema).put("id", 45), 1);
+    record.headers().addString("id", "fromHeader");
+    task.put(Collections.singletonList(record));
+    assertEquals("45", publishedMessage().getAttributesOrThrow("id"));
+  }
+
+  private static SinkRecord record(int partition, long offset, String key, String value) {
+    return new SinkRecord(KAFKA_TOPIC, partition, STRING_SCHEMA, key, STRING_SCHEMA, value, offset);
+  }
+
+  /** Returns the message the task publishes for a record with this value and no key. */
+  private static PubsubMessage message(String value) {
+    return PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8(value)).build();
+  }
+}

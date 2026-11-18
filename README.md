@@ -211,7 +211,7 @@ configurations:
 | gcp.credentials.file.path  | String                        | Optional                    | The filepath, which stores GCP credentials. If not defined, GOOGLE_APPLICATION_CREDENTIALS env is used.                                                                                                                                                                                                                             |
 | gcp.credentials.json       | String                        | Optional                    | GCP credentials JSON blob. If specified, use the explicitly handed credentials. Consider using the externalized secrets feature in Kafka Connect for passing the value.                                                                                                                                                             |
 | metadata.publish           | Boolean                       | false                       | When true, include the Kafka topic, partition, offset, and timestamp as message attributes when a message is published to Pub/Sub.                                                                                                                                                                                                  |
-| headers.publish            | Boolean                       | false                       | When true, include any headers as attributes when a message is published to Pub/Sub.                                                                                                                                                                                                                                                |
+| headers.publish            | Boolean                       | false                       | When true, include any headers as attributes when a message is published to Pub/Sub. A header with a null value is skipped, and a header never replaces the key, metadata or a field attribute. |
 | orderingKeySource          | String (none, key, partition) | none                        | When set to "none", do not set the ordering key. When set to "key", uses a message's key as the ordering key. If set to "partition", converts the partition number to a String and uses that as the ordering key. Note that using "partition" should only be used for low-throughput topics or topics with thousands of partitions. |
 | messageBodyName            | String                        | "cps_message_body"          | When using a struct or map value schema, this field or key name indicates that the corresponding value will go into the Pub/Sub message body.                                                                                                                                                                                       |
 | enableCompression          | Boolean                       | false                       | When true, enable [publish-side compression](https://cloud.google.com/pubsub/docs/publisher#compressing) in order to save on networking costs between Kafka Connect and  Cloud Pub/Sub.                                                                                                                                             |
@@ -285,6 +285,10 @@ The sink connector handles message conversion in the following way:
 * The record-level key for a Kafka message is stored in Pub/Sub message
   attributes with the name "key", converted the same way as a field. It is also
   the ordering key when `orderingKeySource` is `key`.
+* When `headers.publish` is true, each record header becomes an attribute of
+  the same name. A header with a null value is skipped, and a header never
+  replaces the key, metadata or a field attribute: the record's own attribute
+  is kept and the header is left out.
 
 > **Note:** Pub/Sub message attributes have the following
 > [limitations](https://cloud.google.com/pubsub/quotas#resource_limits):
