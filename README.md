@@ -268,21 +268,23 @@ Additionally, a Pub/Sub message cannot exceed 10 MB. We recommend checking your
 
 The sink connector handles message conversion in the following way:
 
-* Integer, float, string, and bytes types in Kafka messages are passed
-  directly into the Pub/Sub message body as bytes.
-* Map and struct types in Kafka messages are stored as Pub/Sub attributes.
-  Pub/Sub attributes only supports string to string mapping. To make the
-  connector as versatile as possible, the `toString()` method is called on
-  objects passed in as the key or value for a map and the value for a struct.
+* Strings are passed into the Pub/Sub message body as UTF-8 and bytes as they
+  are. Numbers, booleans, decimals, dates, times and timestamps are passed as
+  UTF-8 text, such as `45`, `true`, `12.50` or `2024-11-04T11:00:00.000Z`.
+* Arrays are passed into the message body as JSON.
+* Map and struct types in Kafka messages, and JSON objects read without a
+  schema, are split into Pub/Sub attributes:
   * If you set the `messageBodyName` configuration to a struct field or map
-    key, the value of the structure field or the map value (of integer, byte,
-    float, and array type) will be stored in the Pub/Sub message body as bytes.
-* Only primitive array types are supported due to potential collisions
-  of field names or keys of a struct/map array. The connector handles arrays in
-  a fairly predictable fashion, where values are concatenated into a ByteString
-  object.
+    key, its value is converted as above and becomes the message body.
+    A nested struct or map in that field becomes JSON.
+  * Every other top-level field or key becomes an attribute. Pub/Sub
+    attributes are strings, so strings and numbers become their text, bytes
+    become base64, dates and times become ISO 8601 text in UTC, and nested
+    structs, maps and arrays become JSON. Fields whose value is null are left
+    out.
 * The record-level key for a Kafka message is stored in Pub/Sub message
-  attributes as a string, with the name "key".
+  attributes with the name "key", converted the same way as a field. It is also
+  the ordering key when `orderingKeySource` is `key`.
 
 > **Note:** Pub/Sub message attributes have the following
 > [limitations](https://cloud.google.com/pubsub/quotas#resource_limits):

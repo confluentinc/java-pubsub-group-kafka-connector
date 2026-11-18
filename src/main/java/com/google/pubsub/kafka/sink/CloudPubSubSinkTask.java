@@ -33,23 +33,30 @@ import com.google.pubsub.kafka.common.ConnectorUtils;
 import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.OrderingKeySource;
 import com.google.pubsub.v1.ProjectTopicName;
 import com.google.pubsub.v1.PubsubMessage;
+import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.Schema.Type;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Time;
+import org.apache.kafka.connect.data.Values;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.header.ConnectHeaders;
 import org.apache.kafka.connect.header.Header;
+import org.apache.kafka.connect.json.DecimalFormat;
+import org.apache.kafka.connect.json.JsonConverter;
+import org.apache.kafka.connect.json.JsonConverterConfig;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.slf4j.Logger;
@@ -86,6 +93,7 @@ public class CloudPubSubSinkTask extends SinkTask {
   private long compressionBytesThreshold;
   private ConnectorCredentialsProvider gcpCredentialsProvider;
   private com.google.cloud.pubsub.v1.Publisher publisher;
+  private final JsonConverter jsonConverter = createJsonConverter();
 
   /** Holds a list of the publishing futures that have not been processed for a single partition. */
   private class OutstandingFuturesForPartition {
@@ -160,7 +168,7 @@ public class CloudPubSubSinkTask extends SinkTask {
       String key = null;
       String partition = record.kafkaPartition().toString();
       if (record.key() != null) {
-        key = record.key().toString();
+        key = toAttributeValue(record.keySchema(), record.key());
         attributes.put(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key);
       }
       if (includeMetadata) {
@@ -221,114 +229,138 @@ public class CloudPubSubSinkTask extends SinkTask {
     if (value == null) {
       return null;
     }
-    if (schema == null) {
-      String str = value.toString();
-      return ByteString.copyFromUtf8(str);
+    if (value instanceof ByteString) {
+      return (ByteString) value;
     }
-    Schema.Type t = schema.type();
-    switch (t) {
-      case INT8:
-        byte b = (Byte) value;
-        byte[] arr = {b};
-        return ByteString.copyFrom(arr);
-      case INT16:
-        ByteBuffer shortBuf = ByteBuffer.allocate(2);
-        shortBuf.putShort((Short) value);
-        return ByteString.copyFrom(shortBuf);
-      case INT32:
-        ByteBuffer intBuf = ByteBuffer.allocate(4);
-        intBuf.putInt((Integer) value);
-        return ByteString.copyFrom(intBuf);
-      case INT64:
-        ByteBuffer longBuf = ByteBuffer.allocate(8);
-        longBuf.putLong((Long) value);
-        return ByteString.copyFrom(longBuf);
-      case FLOAT32:
-        ByteBuffer floatBuf = ByteBuffer.allocate(4);
-        floatBuf.putFloat((Float) value);
-        return ByteString.copyFrom(floatBuf);
-      case FLOAT64:
-        ByteBuffer doubleBuf = ByteBuffer.allocate(8);
-        doubleBuf.putDouble((Double) value);
-        return ByteString.copyFrom(doubleBuf);
-      case BOOLEAN:
-        byte bool = (byte) ((Boolean) value ? 1 : 0);
-        byte[] boolArr = {bool};
-        return ByteString.copyFrom(boolArr);
-      case STRING:
-        String str = (String) value;
-        return ByteString.copyFromUtf8(str);
-      case BYTES:
-        if (value instanceof ByteString) {
-          return (ByteString) value;
-        } else if (value instanceof byte[]) {
-          return ByteString.copyFrom((byte[]) value);
-        } else if (value instanceof ByteBuffer) {
-          return ByteString.copyFrom((ByteBuffer) value);
-        } else {
-          throw new DataException("Unexpected value class with BYTES schema type.");
-        }
-      case STRUCT:
-        Struct struct = (Struct) value;
-        ByteString msgBody = null;
-        for (Field f : schema.fields()) {
-          Schema.Type fieldType = f.schema().type();
-          if (fieldType == Type.MAP || fieldType == Type.STRUCT) {
-            throw new DataException(
-                "Struct type does not support nested Map or Struct types, "
-                    + "present in field "
-                    + f.name());
-          }
+    if (schema != null && schema.type().isPrimitive()) {
+      ConnectSchema.validateValue(schema, value);
+    }
+    if (value instanceof byte[]) {
+      return ByteString.copyFrom((byte[]) value);
+    }
+    if (value instanceof ByteBuffer) {
+      return ByteString.copyFrom((ByteBuffer) value);
+    }
+    // A top-level struct or map, including a JSON object read without a schema, is split into the
+    // body and attributes. Attributes are null for the body field itself.
+    if (attributes != null && value instanceof Struct) {
+      return handleStruct((Struct) value, attributes);
+    }
+    if (attributes != null && value instanceof Map) {
+      return handleMap(schema, (Map<?, ?>) value, attributes);
+    }
+    // Strings, numbers, booleans, decimals and dates as text; nested structs, maps and arrays as
+    // JSON. The same text as in attributes.
+    return ByteString.copyFromUtf8(toAttributeValue(schema, value));
+  }
 
-          Object val = struct.get(f);
-          if (val == null) {
-            if (!f.schema().isOptional()) {
-              throw new DataException("Struct message missing required field " + f.name());
-            } else {
-              continue;
-            }
-          }
-          if (f.name().equals(messageBodyName)) {
-            Schema bodySchema = f.schema();
-            msgBody = handleValue(bodySchema, val, null);
-          } else {
-            attributes.put(f.name(), val.toString());
-          }
-        }
-        if (msgBody != null) {
-          return msgBody;
+  /**
+   * Splits a struct: the field named by messageBodyName becomes the body and the others become
+   * attributes.
+   */
+  private ByteString handleStruct(Struct struct, Map<String, String> attributes) {
+    ByteString msgBody = null;
+    for (Field f : struct.schema().fields()) {
+      Object val = struct.get(f);
+      if (val == null) {
+        if (!f.schema().isOptional()) {
+          throw new DataException("Struct message missing required field " + f.name());
         } else {
-          return ByteString.EMPTY;
+          continue;
         }
-      case MAP:
-        Map<Object, Object> map = (Map<Object, Object>) value;
-        Set<Object> keys = map.keySet();
-        ByteString mapBody = null;
-        for (Object key : keys) {
-          if (key.equals(messageBodyName)) {
-            mapBody = ByteString.copyFromUtf8(map.get(key).toString());
-          } else {
-            attributes.put(key.toString(), map.get(key).toString());
-          }
-        }
-        if (mapBody != null) {
-          return mapBody;
-        } else {
-          return ByteString.EMPTY;
-        }
-      case ARRAY:
-        Schema.Type arrType = schema.valueSchema().type();
-        if (arrType == Type.MAP || arrType == Type.STRUCT) {
-          throw new DataException("Array type does not support Map or Struct types.");
-        }
-        ByteString out = ByteString.EMPTY;
-        Object[] objArr = (Object[]) value;
-        for (Object o : objArr) {
-          out = out.concat(handleValue(schema.valueSchema(), o, null));
-        }
-        return out;
+      }
+      if (f.name().equals(messageBodyName)) {
+        msgBody = handleValue(f.schema(), val, null);
+      } else {
+        attributes.put(f.name(), toAttributeValue(f.schema(), val));
+      }
     }
-    return ByteString.EMPTY;
+    if (msgBody != null) {
+      return msgBody;
+    } else {
+      return ByteString.EMPTY;
+    }
+  }
+
+  /**
+   * Splits a map the way a struct is split: the entry named by messageBodyName becomes the body and
+   * the others become attributes. The schema is null for schemaless JSON.
+   */
+  private ByteString handleMap(Schema schema, Map<?, ?> map, Map<String, String> attributes) {
+    Schema valueSchema = schema == null ? null : schema.valueSchema();
+    ByteString mapBody = null;
+    for (Map.Entry<?, ?> entry : map.entrySet()) {
+      if (entry.getValue() == null) {
+        continue;
+      }
+      if (entry.getKey().equals(messageBodyName)) {
+        mapBody = handleValue(valueSchema, entry.getValue(), null);
+      } else {
+        if (valueSchema != null && valueSchema.type().isPrimitive()) {
+          // Unlike Struct.put, a map doesn't check its values against the schema. handleValue
+          // checks the body entry.
+          ConnectSchema.validateValue(valueSchema, entry.getValue());
+        }
+        attributes.put(entry.getKey().toString(), toAttributeValue(valueSchema, entry.getValue()));
+      }
+    }
+    if (mapBody != null) {
+      return mapBody;
+    } else {
+      return ByteString.EMPTY;
+    }
+  }
+
+  /**
+   * Returns the text of a key or field for an attribute: JSON for structs, maps and arrays, ISO
+   * 8601 in UTC for dates and times, base64 for bytes, and plain text for anything else.
+   */
+  private String toAttributeValue(Schema schema, Object value) {
+    if (value instanceof Struct || value instanceof Map || value instanceof List) {
+      return toJson(schema, value).toStringUtf8();
+    }
+    if (value instanceof java.util.Date) {
+      return formatDate(schema, (java.util.Date) value);
+    }
+    if (value instanceof BigDecimal) {
+      return ((BigDecimal) value).toPlainString();
+    }
+    try {
+      return Values.convertToString(schema, value);
+    } catch (DataException e) {
+      // Not a Kafka Connect type, so there is no standard text for it.
+      return value.toString();
+    }
+  }
+
+  /**
+   * Formats the Date, Time and Timestamp logical types as Values.convertToString() does, but in
+   * UTC: Values uses the worker's time zone and still ends the text with Z.
+   */
+  private static String formatDate(Schema schema, java.util.Date value) {
+    String name = schema == null ? null : schema.name();
+    String pattern = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
+    if (org.apache.kafka.connect.data.Date.LOGICAL_NAME.equals(name)) {
+      pattern = "yyyy-MM-dd";
+    } else if (Time.LOGICAL_NAME.equals(name)) {
+      pattern = "HH:mm:ss.SSS'Z'";
+    }
+    SimpleDateFormat format = new SimpleDateFormat(pattern);
+    format.setTimeZone(TimeZone.getTimeZone("UTC"));
+    return format.format(value);
+  }
+
+  private ByteString toJson(Schema schema, Object value) {
+    return ByteString.copyFrom(jsonConverter.fromConnectData(cpsTopic, schema, value));
+  }
+
+  private static JsonConverter createJsonConverter() {
+    Map<String, Object> config = new HashMap<>();
+    config.put(JsonConverterConfig.SCHEMAS_ENABLE_CONFIG, false);
+    config.put(JsonConverterConfig.DECIMAL_FORMAT_CONFIG, DecimalFormat.NUMERIC.name());
+    JsonConverter converter = new JsonConverter();
+    converter.configure(config, false);
+    return converter;
   }
 
   @Override

@@ -16,6 +16,7 @@
 package com.google.pubsub.kafka.sink;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -30,7 +31,10 @@ import com.google.cloud.pubsub.v1.Publisher;
 import com.google.protobuf.ByteString;
 import com.google.pubsub.kafka.common.ConnectorUtils;
 import com.google.pubsub.v1.PubsubMessage;
+import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -41,9 +45,11 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Timestamp;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.Before;
@@ -217,6 +223,30 @@ public class CloudPubSubSinkTaskTest {
   }
 
   @Test(expected = DataException.class)
+  public void testStringSchemaWithNonStringValue() {
+    task.start(props);
+    SinkRecord record = new SinkRecord(null, -1, null, null, Schema.STRING_SCHEMA, 45, -1);
+    task.put(Collections.singletonList(record));
+  }
+
+  @Test(expected = DataException.class)
+  public void testMapSchemaWithMismatchedValue() {
+    task.start(props);
+    Schema schema = SchemaBuilder.map(Schema.STRING_SCHEMA, Schema.INT32_SCHEMA).build();
+    Map<String, Object> val = new HashMap<>();
+    val.put("count", "abc");
+    SinkRecord record = new SinkRecord(null, -1, null, null, schema, val, -1);
+    task.put(Collections.singletonList(record));
+  }
+
+  @Test(expected = DataException.class)
+  public void testBytesSchemaWithNonBytesValue() {
+    task.start(props);
+    SinkRecord record = new SinkRecord(null, -1, null, null, Schema.BYTES_SCHEMA, "abc", -1);
+    task.put(Collections.singletonList(record));
+  }
+
+  @Test
   public void testStructSchemaWithNestedSchema() {
     task.start(props);
 
@@ -235,6 +265,9 @@ public class CloudPubSubSinkTaskTest {
     List<SinkRecord> list = new ArrayList<>();
     list.add(record);
     task.put(list);
+    PubsubMessage message = publishedMessage();
+    assertEquals("tide", message.getAttributesOrThrow(FIELD_STRING1));
+    assertEquals("{}", message.getAttributesOrThrow(FIELD_STRING2));
   }
 
   @Test
@@ -261,18 +294,10 @@ public class CloudPubSubSinkTaskTest {
   public void testArraySchema() {
     task.start(props);
     Schema schema = SchemaBuilder.array(SchemaBuilder.string()).build();
-    String[] val = {"Roll", "tide"};
+    List<String> val = Arrays.asList("Roll", "tide");
     SinkRecord record = new SinkRecord(null, -1, null, null, schema, val, -1);
-    List<SinkRecord> list = new ArrayList<>();
-    list.add(record);
-    task.put(list);
-    schema = SchemaBuilder.array(SchemaBuilder.struct()).build();
-    record = new SinkRecord(null, -1, null, null, schema, null, -1);
-    list.add(record);
-    try {
-      task.put(list);
-    } catch (DataException e) {
-    } // Expected, pass.
+    task.put(Collections.singletonList(record));
+    assertEquals("[\"Roll\",\"tide\"]", publishedMessage().getData().toStringUtf8());
   }
 
   @Test
@@ -818,4 +843,166 @@ public class CloudPubSubSinkTaskTest {
     SpyableFuture<String> future = new SpyableFuture(new Exception());
     return spy(future);
   }
-}
+
+  @Test
+  public void testStructKeyIsJson() {
+    task.start(props);
+    Schema keySchema = SchemaBuilder.struct().field("id", Schema.INT32_SCHEMA).build();
+    Struct key = new Struct(keySchema).put("id", 45);
+    task.put(
+        Collections.singletonList(
+            new SinkRecord(KAFKA_TOPIC, 0, keySchema, key, STRING_SCHEMA, "fox", 1)));
+    assertEquals(
+        "{\"id\":45}",
+        publishedMessage().getAttributesOrThrow(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE));
+  }
+
+  @Test
+  public void testBytesKeyIsBase64() {
+    props.put(CloudPubSubSinkConnector.ORDERING_KEY_SOURCE, "key");
+    task.start(props);
+    byte[] key = "dog".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    task.put(
+        Collections.singletonList(
+            new SinkRecord(KAFKA_TOPIC, 0, Schema.BYTES_SCHEMA, key, STRING_SCHEMA, "fox", 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals("ZG9n", message.getAttributesOrThrow(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE));
+    assertEquals("ZG9n", message.getOrderingKey());
+  }
+
+  @Test
+  public void testNumbersAndBooleansAreText() {
+    task.start(props);
+    task.put(
+        Arrays.asList(
+            new SinkRecord(KAFKA_TOPIC, 0, null, null, Schema.INT32_SCHEMA, 45, 1),
+            new SinkRecord(KAFKA_TOPIC, 0, null, null, Schema.FLOAT64_SCHEMA, 1.5, 2),
+            new SinkRecord(KAFKA_TOPIC, 0, null, null, Schema.BOOLEAN_SCHEMA, true, 3)));
+    ArgumentCaptor<PubsubMessage> captor = ArgumentCaptor.forClass(PubsubMessage.class);
+    verify(publisher, times(3)).publish(captor.capture());
+    assertEquals("45", captor.getAllValues().get(0).getData().toStringUtf8());
+    assertEquals("1.5", captor.getAllValues().get(1).getData().toStringUtf8());
+    assertEquals("true", captor.getAllValues().get(2).getData().toStringUtf8());
+  }
+
+  @Test
+  public void testFieldAttributes() {
+    task.start(props);
+    Schema address = SchemaBuilder.struct().field("city", Schema.STRING_SCHEMA).build();
+    Schema schema =
+        SchemaBuilder.struct()
+            .field("raw", Schema.BYTES_SCHEMA)
+            .field("created", Timestamp.SCHEMA)
+            .field("address", address)
+            .field("props", SchemaBuilder.map(Schema.STRING_SCHEMA, Schema.STRING_SCHEMA).build())
+            .field("tags", SchemaBuilder.array(Schema.STRING_SCHEMA).build())
+            .build();
+    Struct value =
+        new Struct(schema)
+            .put("raw", java.nio.ByteBuffer.wrap(new byte[] {'d', 'o', 'g'}))
+            .put("created", new java.util.Date(1730718000000L))
+            .put("address", new Struct(address).put("city", "Pune"))
+            .put("props", Collections.singletonMap("region", "eu"))
+            .put("tags", Arrays.asList("a", "b,c"));
+    task.put(
+        Collections.singletonList(new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, value, 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals(ByteString.EMPTY, message.getData());
+    assertEquals("ZG9n", message.getAttributesOrThrow("raw"));
+    assertEquals("2024-11-04T11:00:00.000Z", message.getAttributesOrThrow("created"));
+    assertEquals("{\"city\":\"Pune\"}", message.getAttributesOrThrow("address"));
+    assertEquals("{\"region\":\"eu\"}", message.getAttributesOrThrow("props"));
+    assertEquals("[\"a\",\"b,c\"]", message.getAttributesOrThrow("tags"));
+  }
+
+  @Test
+  public void testNestedBodyFieldIsJson() {
+    task.start(props);
+    Schema order = SchemaBuilder.struct().field("order", Schema.INT32_SCHEMA).build();
+    Schema schema =
+        SchemaBuilder.struct()
+            .field("id", Schema.INT32_SCHEMA)
+            .field(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, order)
+            .build();
+    Struct value =
+        new Struct(schema)
+            .put("id", 45)
+            .put(
+                CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME,
+                new Struct(order).put("order", 45));
+    task.put(
+        Collections.singletonList(new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, value, 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals("{\"order\":45}", message.getData().toStringUtf8());
+    assertEquals("45", message.getAttributesOrThrow("id"));
+  }
+
+  @Test
+  public void testSchemalessObjectIsSplitLikeStruct() {
+    task.start(props);
+    Map<String, Object> value = new HashMap<>();
+    value.put("id", 45L);
+    value.put("note", null);
+    value.put("address", Collections.singletonMap("city", "Pune"));
+    value.put(
+        CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, Collections.singletonMap("order", 45L));
+    task.put(Collections.singletonList(new SinkRecord(KAFKA_TOPIC, 0, null, null, null, value, 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals("{\"order\":45}", message.getData().toStringUtf8());
+    assertEquals("45", message.getAttributesOrThrow("id"));
+    assertEquals("{\"city\":\"Pune\"}", message.getAttributesOrThrow("address"));
+    assertFalse(message.containsAttributes("note"));
+  }
+
+  @Test
+  public void testSchemalessArrayIsJson() {
+    task.start(props);
+    task.put(
+        Collections.singletonList(
+            new SinkRecord(KAFKA_TOPIC, 0, null, null, null, Arrays.asList(1L, 2L), 1)));
+    assertEquals("[1,2]", publishedMessage().getData().toStringUtf8());
+  }
+
+  @Test
+  public void testLogicalTypeValuesAreText() {
+    task.start(props);
+    Schema decimal = Decimal.schema(2);
+    task.put(
+        Arrays.asList(
+            new SinkRecord(KAFKA_TOPIC, 0, null, null, decimal, new BigDecimal("12.50"), 1),
+            new SinkRecord(
+                KAFKA_TOPIC,
+                0,
+                null,
+                null,
+                Timestamp.SCHEMA,
+                new java.util.Date(1730718000000L),
+                2)));
+    ArgumentCaptor<PubsubMessage> captor = ArgumentCaptor.forClass(PubsubMessage.class);
+    verify(publisher, times(2)).publish(captor.capture());
+    assertEquals("12.50", captor.getAllValues().get(0).getData().toStringUtf8());
+    assertEquals("2024-11-04T11:00:00.000Z", captor.getAllValues().get(1).getData().toStringUtf8());
+  }
+
+  @Test
+  public void testMapBodyBytesAndNullEntries() {
+    task.start(props);
+    Schema schema =
+        SchemaBuilder.map(Schema.STRING_SCHEMA, SchemaBuilder.bytes().optional().build()).build();
+    Map<String, Object> value = new HashMap<>();
+    value.put(
+        CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME,
+        java.nio.ByteBuffer.wrap(new byte[] {'f', 'o', 'x'}));
+    value.put(FIELD_STRING1, null);
+    task.put(
+        Collections.singletonList(new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, value, 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals("fox", message.getData().toStringUtf8());
+    assertEquals(0, message.getAttributesCount());
+  }
+
+  private PubsubMessage publishedMessage() {
+    ArgumentCaptor<PubsubMessage> captor = ArgumentCaptor.forClass(PubsubMessage.class);
+    verify(publisher).publish(captor.capture());
+    return captor.getValue();
+  }}
