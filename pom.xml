@@ -312,4 +312,59 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!--
+      Builds a jar with only the Cloud Pub/Sub sink connector: mvn package -P sink-only
+      Leaves out the Cloud Pub/Sub source connector, the Pub/Sub Lite connectors and their
+      libraries, and kafka-clients with its compression libraries, which the Kafka Connect
+      runtime already provides. The default build is unchanged.
+    -->
+    <profile>
+      <id>sink-only</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <configuration>
+              <excludes>
+                <exclude>com/google/pubsub/kafka/source/**</exclude>
+                <exclude>com/google/pubsublite/**</exclude>
+              </excludes>
+              <testExcludes>
+                <testExclude>com/google/pubsub/kafka/source/**</testExclude>
+                <testExclude>com/google/pubsublite/**</testExclude>
+                <testExclude>it/**</testExclude>
+              </testExcludes>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-shade-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>default</id>
+                <configuration>
+                  <artifactSet>
+                    <excludes combine.children="append">
+                      <exclude>com.google.cloud:google-cloud-pubsublite</exclude>
+                      <exclude>com.google.api.grpc:proto-google-cloud-pubsublite-v1</exclude>
+                      <exclude>com.google.api.grpc:grpc-google-cloud-pubsublite-v1</exclude>
+                      <exclude>com.google.cloud:pubsublite-kafka</exclude>
+                      <exclude>org.apache.kafka:kafka-clients</exclude>
+                      <exclude>com.github.luben:zstd-jni</exclude>
+                      <exclude>org.lz4:lz4-java</exclude>
+                      <exclude>at.yawk.lz4:lz4-java</exclude>
+                      <exclude>org.xerial.snappy:snappy-java</exclude>
+                    </excludes>
+                  </artifactSet>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
