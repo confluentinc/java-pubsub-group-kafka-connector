@@ -36,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -257,10 +258,12 @@ public class CloudPubSubSinkTaskTest {
         SchemaBuilder.struct()
             .field(FIELD_STRING1, SchemaBuilder.string())
             .field(FIELD_STRING2, nestedSchema)
+            .field(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, SchemaBuilder.string())
             .build();
     Struct val = new Struct(schema);
     val.put(FIELD_STRING1, "tide");
     val.put(FIELD_STRING2, nestedVal);
+    val.put(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, "eagle");
     SinkRecord record = new SinkRecord(null, -1, null, null, schema, val, -1);
     List<SinkRecord> list = new ArrayList<>();
     list.add(record);
@@ -268,6 +271,7 @@ public class CloudPubSubSinkTaskTest {
     PubsubMessage message = publishedMessage();
     assertEquals("tide", message.getAttributesOrThrow(FIELD_STRING1));
     assertEquals("{}", message.getAttributesOrThrow(FIELD_STRING2));
+    assertEquals("eagle", message.getData().toStringUtf8());
   }
 
   @Test
@@ -896,6 +900,7 @@ public class CloudPubSubSinkTaskTest {
             .field("address", address)
             .field("props", SchemaBuilder.map(Schema.STRING_SCHEMA, Schema.STRING_SCHEMA).build())
             .field("tags", SchemaBuilder.array(Schema.STRING_SCHEMA).build())
+            .field(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, Schema.STRING_SCHEMA)
             .build();
     Struct value =
         new Struct(schema)
@@ -903,11 +908,12 @@ public class CloudPubSubSinkTaskTest {
             .put("created", new java.util.Date(1730718000000L))
             .put("address", new Struct(address).put("city", "Pune"))
             .put("props", Collections.singletonMap("region", "eu"))
-            .put("tags", Arrays.asList("a", "b,c"));
+            .put("tags", Arrays.asList("a", "b,c"))
+            .put(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, "order placed");
     task.put(
         Collections.singletonList(new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, value, 1)));
     PubsubMessage message = publishedMessage();
-    assertEquals(ByteString.EMPTY, message.getData());
+    assertEquals("order placed", message.getData().toStringUtf8());
     assertEquals("ZG9n", message.getAttributesOrThrow("raw"));
     assertEquals("2024-11-04T11:00:00.000Z", message.getAttributesOrThrow("created"));
     assertEquals("{\"city\":\"Pune\"}", message.getAttributesOrThrow("address"));
@@ -952,6 +958,69 @@ public class CloudPubSubSinkTaskTest {
     assertEquals("45", message.getAttributesOrThrow("id"));
     assertEquals("{\"city\":\"Pune\"}", message.getAttributesOrThrow("address"));
     assertFalse(message.containsAttributes("note"));
+  }
+
+  /**
+   * Tests that a struct without a field named by messageBodyName is published whole, as JSON in the
+   * body, and that its fields are not added as attributes.
+   */
+  @Test
+  public void testStructWithoutBodyFieldIsPublishedAsJson() {
+    props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_METADATA, "true");
+    task.start(props);
+    Schema address = SchemaBuilder.struct().field("city", Schema.STRING_SCHEMA).build();
+    Schema schema =
+        SchemaBuilder.struct()
+            .field("id", Schema.INT32_SCHEMA)
+            .field("address", address)
+            .field("created", Timestamp.SCHEMA)
+            .build();
+    Struct value =
+        new Struct(schema)
+            .put("id", 45)
+            .put("address", new Struct(address).put("city", "Pune"))
+            .put("created", new java.util.Date(1730718000000L));
+    task.put(
+        Collections.singletonList(
+            new SinkRecord(KAFKA_TOPIC, 0, Schema.STRING_SCHEMA, "order-1", schema, value, 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals(
+        "{\"id\":45,\"address\":{\"city\":\"Pune\"},\"created\":1730718000000}",
+        message.getData().toStringUtf8());
+    assertFalse(message.containsAttributes("id"));
+    assertFalse(message.containsAttributes("address"));
+    assertEquals("order-1", message.getAttributesOrThrow(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE));
+    assertEquals(KAFKA_TOPIC, message.getAttributesOrThrow(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE));
+  }
+
+  /** Tests that a JSON object without a messageBodyName entry is published whole, as JSON. */
+  @Test
+  public void testSchemalessObjectWithoutBodyIsPublishedAsJson() {
+    task.start(props);
+    Map<String, Object> value = new LinkedHashMap<>();
+    value.put("id", 45L);
+    value.put("address", Collections.singletonMap("city", "Pune"));
+    task.put(Collections.singletonList(new SinkRecord(KAFKA_TOPIC, 0, null, null, null, value, 1)));
+    PubsubMessage message = publishedMessage();
+    assertEquals("{\"id\":45,\"address\":{\"city\":\"Pune\"}}", message.getData().toStringUtf8());
+    assertEquals(0, message.getAttributesCount());
+  }
+
+  /** Tests that a header Pub/Sub could not accept is left out and the record is still published. */
+  @Test
+  public void testOversizedHeaderIsDroppedAndRecordPublished() {
+    props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS, "true");
+    task.start(props);
+    SinkRecord record = new SinkRecord(KAFKA_TOPIC, 0, null, null, Schema.STRING_SCHEMA, "a", 1);
+    char[] big = new char[1025];
+    Arrays.fill(big, 'x');
+    record.headers().addString("big", new String(big));
+    record.headers().addString("trace", "abc");
+    task.put(Collections.singletonList(record));
+    PubsubMessage message = publishedMessage();
+    assertEquals("a", message.getData().toStringUtf8());
+    assertFalse(message.containsAttributes("big"));
+    assertEquals("abc", message.getAttributesOrThrow("trace"));
   }
 
   @Test
@@ -1041,9 +1110,16 @@ public class CloudPubSubSinkTaskTest {
   public void testHeadersDoNotReplaceFieldAttributes() {
     props.put(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS, "true");
     task.start(props);
-    Schema schema = SchemaBuilder.struct().field("id", SchemaBuilder.int32()).build();
-    SinkRecord record =
-        new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, new Struct(schema).put("id", 45), 1);
+    Schema schema =
+        SchemaBuilder.struct()
+            .field("id", SchemaBuilder.int32())
+            .field(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, SchemaBuilder.string())
+            .build();
+    Struct value =
+        new Struct(schema)
+            .put("id", 45)
+            .put(CloudPubSubSinkConnector.DEFAULT_MESSAGE_BODY_NAME, "order placed");
+    SinkRecord record = new SinkRecord(KAFKA_TOPIC, 0, null, null, schema, value, 1);
     record.headers().addString("id", "fromHeader");
     task.put(Collections.singletonList(record));
     assertEquals("45", publishedMessage().getAttributesOrThrow("id"));

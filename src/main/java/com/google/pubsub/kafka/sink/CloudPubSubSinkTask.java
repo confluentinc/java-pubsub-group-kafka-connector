@@ -96,6 +96,10 @@ public class CloudPubSubSinkTask extends SinkTask {
   private ConnectorCredentialsProvider gcpCredentialsProvider;
   private com.google.cloud.pubsub.v1.Publisher publisher;
   private final JsonConverter jsonConverter = createJsonConverter();
+  // Most header names remembered for warning once each, so headers with ever-changing names
+  // cannot grow this set without bound.
+  private static final int MAX_WARNED_HEADER_NAMES = 1000;
+  private final Set<String> warnedHeaderNames = new HashSet<>();
 
   /** Holds a list of the publishing futures that have not been processed for a single partition. */
   private class OutstandingFuturesForPartition {
@@ -189,10 +193,8 @@ public class CloudPubSubSinkTask extends SinkTask {
             continue;
           }
           if (recordAttributes.contains(header.key())) {
-            log.debug(
-                "Not publishing header {} as an attribute because the message already has an"
-                    + " attribute with that name",
-                header.key());
+            warnDroppedHeader(
+                header.key(), "the message already has an attribute with that name");
             continue;
           }
           attributes.put(header.key(), header.value().toString());
@@ -226,17 +228,35 @@ public class CloudPubSubSinkTask extends SinkTask {
     if (record.headers() != null) {
       int headerCount = 0;
       for (Header header : record.headers()) {
-        if (header.key().getBytes().length < 257
-            && String.valueOf(header.value()).getBytes().length < 1025) {
+        if (headerCount > 100) {
+          warnDroppedHeader(header.key(), "the message already has the most headers allowed");
+        } else if (header.key().getBytes().length >= 257) {
+          warnDroppedHeader(header.key(), "its name is longer than 256 bytes");
+        } else if (String.valueOf(header.value()).getBytes().length >= 1025) {
+          warnDroppedHeader(header.key(), "its value is longer than 1024 bytes");
+        } else {
           headers.add(header);
           headerCount++;
-        }
-        if (headerCount > 100) {
-          break;
         }
       }
     }
     return headers;
+  }
+
+  /**
+   * Logs once per header name why a header is not published, without its value, so the log never
+   * holds record data.
+   */
+  private void warnDroppedHeader(String name, String reason) {
+    if (warnedHeaderNames.size() >= MAX_WARNED_HEADER_NAMES || !warnedHeaderNames.add(name)) {
+      return;
+    }
+    String shown = name.length() > 64 ? name.substring(0, 64) + "..." : name;
+    log.warn(
+        "Not publishing header {} as an attribute: {}. The record is still published; this is"
+            + " logged once per header name.",
+        shown,
+        reason);
   }
 
   private ByteString handleValue(Schema schema, Object value, Map<String, String> attributes) {
@@ -255,8 +275,9 @@ public class CloudPubSubSinkTask extends SinkTask {
     if (value instanceof ByteBuffer) {
       return ByteString.copyFrom((ByteBuffer) value);
     }
-    // A top-level struct or map, including a JSON object read without a schema, is split into the
-    // body and attributes. Attributes are null for the body field itself.
+    // A top-level struct or map, including a JSON object read without a schema, with a field named
+    // by messageBodyName is split into the body and attributes; without one, the whole value is
+    // the body as JSON. Attributes are null for the body field itself.
     if (attributes != null && value instanceof Struct) {
       return handleStruct((Struct) value, attributes);
     }
@@ -270,9 +291,12 @@ public class CloudPubSubSinkTask extends SinkTask {
 
   /**
    * Splits a struct: the field named by messageBodyName becomes the body and the others become
-   * attributes.
+   * attributes. A struct without that field is published whole, as JSON in the body.
    */
   private ByteString handleStruct(Struct struct, Map<String, String> attributes) {
+    if (struct.schema().field(messageBodyName) == null) {
+      return toJson(struct.schema(), struct);
+    }
     ByteString msgBody = null;
     for (Field f : struct.schema().fields()) {
       Object val = struct.get(f);
@@ -298,9 +322,13 @@ public class CloudPubSubSinkTask extends SinkTask {
 
   /**
    * Splits a map the way a struct is split: the entry named by messageBodyName becomes the body and
-   * the others become attributes. The schema is null for schemaless JSON.
+   * the others become attributes. A map without that entry is published whole, as JSON in the
+   * body. The schema is null for schemaless JSON.
    */
   private ByteString handleMap(Schema schema, Map<?, ?> map, Map<String, String> attributes) {
+    if (!map.containsKey(messageBodyName)) {
+      return toJson(schema, map);
+    }
     Schema valueSchema = schema == null ? null : schema.valueSchema();
     ByteString mapBody = null;
     for (Map.Entry<?, ?> entry : map.entrySet()) {

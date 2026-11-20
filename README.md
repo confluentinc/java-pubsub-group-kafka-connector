@@ -211,9 +211,9 @@ configurations:
 | gcp.credentials.file.path  | String                        | Optional                    | The filepath, which stores GCP credentials. If not defined, GOOGLE_APPLICATION_CREDENTIALS env is used.                                                                                                                                                                                                                             |
 | gcp.credentials.json       | String                        | Optional                    | GCP credentials JSON blob. If specified, use the explicitly handed credentials. Consider using the externalized secrets feature in Kafka Connect for passing the value.                                                                                                                                                             |
 | metadata.publish           | Boolean                       | false                       | When true, include the Kafka topic, partition, offset, and timestamp as message attributes when a message is published to Pub/Sub.                                                                                                                                                                                                  |
-| headers.publish            | Boolean                       | false                       | When true, include any headers as attributes when a message is published to Pub/Sub. A header with a null value is skipped, and a header never replaces the key, metadata or a field attribute. |
+| headers.publish            | Boolean                       | false                       | When true, include any headers as attributes when a message is published to Pub/Sub. A header with a null value is skipped, and a header never replaces the key, metadata or a field attribute. Headers left out are logged at WARN once per header name. |
 | orderingKeySource          | String (none, key, partition) | none                        | When set to "none", do not set the ordering key. When set to "key", uses a message's key as the ordering key. If set to "partition", converts the partition number to a String and uses that as the ordering key. Note that using "partition" should only be used for low-throughput topics or topics with thousands of partitions. |
-| messageBodyName            | String                        | "cps_message_body"          | When using a struct or map value schema, this field or key name indicates that the corresponding value will go into the Pub/Sub message body.                                                                                                                                                                                       |
+| messageBodyName            | String                        | "cps_message_body"          | When using a struct or map value schema, this field or key name indicates that the corresponding value will go into the Pub/Sub message body, and the other fields become attributes. A struct or map without this field is published whole, as JSON in the message body.                                                                                                                                                                                       |
 | enableCompression          | Boolean                       | false                       | When true, enable [publish-side compression](https://cloud.google.com/pubsub/docs/publisher#compressing) in order to save on networking costs between Kafka Connect and  Cloud Pub/Sub.                                                                                                                                             |
 | compressionBytesThreshold  | Long                          | 240                         | When enableCompression is true, the minimum size of publish request (in bytes) to compress.
 
@@ -273,22 +273,27 @@ The sink connector handles message conversion in the following way:
   UTF-8 text, such as `45`, `true`, `12.50` or `2024-11-04T11:00:00.000Z`.
 * Arrays are passed into the message body as JSON.
 * Map and struct types in Kafka messages, and JSON objects read without a
-  schema, are split into Pub/Sub attributes:
-  * If you set the `messageBodyName` configuration to a struct field or map
-    key, its value is converted as above and becomes the message body.
-    A nested struct or map in that field becomes JSON.
-  * Every other top-level field or key becomes an attribute. Pub/Sub
-    attributes are strings, so strings and numbers become their text, bytes
-    become base64, dates and times become ISO 8601 text in UTC, and nested
-    structs, maps and arrays become JSON. Fields whose value is null are left
-    out.
+  schema, depend on whether they have a field or key named by
+  `messageBodyName` (default `cps_message_body`):
+  * Without that field, the whole value becomes the message body as JSON, and
+    its fields are not added as attributes. In the JSON, dates are days since
+    1970, times are milliseconds since midnight, timestamps are milliseconds
+    since 1970, and decimals are numbers, as in Kafka's JSON converter.
+  * With that field, its value is converted as above and becomes the message
+    body; a nested struct or map in it becomes JSON. Every other top-level
+    field or key becomes an attribute. Pub/Sub attributes are strings, so
+    strings and numbers become their text, bytes become base64, dates and
+    times become ISO 8601 text in UTC, and nested structs, maps and arrays
+    become JSON. Fields whose value is null are left out.
 * The record-level key for a Kafka message is stored in Pub/Sub message
   attributes with the name "key", converted the same way as a field. It is also
   the ordering key when `orderingKeySource` is `key`.
 * When `headers.publish` is true, each record header becomes an attribute of
   the same name. A header with a null value is skipped, and a header never
   replaces the key, metadata or a field attribute: the record's own attribute
-  is kept and the header is left out.
+  is kept and the header is left out. A header left out this way, or because
+  of the limits below, is logged at WARN once per header name; the record is
+  still published.
 
 > **Note:** Pub/Sub message attributes have the following
 > [limitations](https://cloud.google.com/pubsub/quotas#resource_limits):
