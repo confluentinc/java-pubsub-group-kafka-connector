@@ -58,7 +58,7 @@ public class CloudPubSubSinkConnector extends SinkConnector {
   public static final long DEFAULT_MAX_OUTSTANDING_REQUEST_BYTES = Long.MAX_VALUE;
   public static final long DEFAULT_MAX_OUTSTANDING_MESSAGES = Long.MAX_VALUE;
   public static final String CPS_MESSAGE_BODY_NAME = "messageBodyName";
-  public static final String DEFAULT_MESSAGE_BODY_NAME = "cps_message_body";
+  public static final String DEFAULT_MESSAGE_BODY_NAME = "";
   public static final String PUBLISH_KAFKA_METADATA = "metadata.publish";
   public static final String PUBLISH_KAFKA_HEADERS = "headers.publish";
   public static final String ORDERING_KEY_SOURCE = "orderingKeySource";
@@ -232,8 +232,9 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             Type.STRING,
             DEFAULT_MESSAGE_BODY_NAME,
             Importance.MEDIUM,
-            "When using a struct or map value schema, this field or key name indicates that the "
-                + "corresponding value will go into the Pub/Sub message body.")
+            "For a struct or map value, the name of the top-level field or key whose value becomes "
+                + "the Pub/Sub message body; the other fields become attributes. When empty (the "
+                + "default), the whole value is published as JSON in the message body.")
         .define(
             ConnectorUtils.GCP_CREDENTIALS_FILE_PATH_CONFIG,
             Type.STRING,

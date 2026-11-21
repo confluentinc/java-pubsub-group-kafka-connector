@@ -100,6 +100,11 @@ public class CloudPubSubSinkTask extends SinkTask {
   // cannot grow this set without bound.
   private static final int MAX_WARNED_HEADER_NAMES = 1000;
   private final Set<String> warnedHeaderNames = new HashSet<>();
+  // True when messageBodyName is set, so struct and map values are split into body and attributes.
+  private boolean splitBody;
+  // Topics already warned about for records without the messageBodyName field.
+  private final Set<String> warnedMissingBodyTopics = new HashSet<>();
+  private String currentTopic;
 
   /** Holds a list of the publishing futures that have not been processed for a single partition. */
   private class OutstandingFuturesForPartition {
@@ -148,6 +153,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     maxShutdownTimeoutMs =
         (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_SHUTDOWN_TIMEOUT_MS);
     messageBodyName = (String) validatedProps.get(CloudPubSubSinkConnector.CPS_MESSAGE_BODY_NAME);
+    splitBody = messageBodyName != null && !messageBodyName.trim().isEmpty();
     includeMetadata = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_METADATA);
     includeHeaders = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS);
     orderingKeySource =
@@ -170,6 +176,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     for (SinkRecord record : sinkRecords) {
       log.trace("Received record: " + record.toString());
       Map<String, String> attributes = new HashMap<>();
+      currentTopic = record.topic();
       ByteString value = handleValue(record.valueSchema(), record.value(), attributes);
       String key = null;
       String partition = record.kafkaPartition().toString();
@@ -243,6 +250,17 @@ public class CloudPubSubSinkTask extends SinkTask {
     return headers;
   }
 
+  /** Logs once per topic that a record has no messageBodyName field, which may be a typo. */
+  private void warnMissingBodyField() {
+    if (warnedMissingBodyTopics.add(String.valueOf(currentTopic))) {
+      log.warn(
+          "Records from topic {} have no field named {} (messageBodyName), so their message body is"
+              + " empty and all fields are published as attributes. This is logged once per topic.",
+          currentTopic,
+          messageBodyName);
+    }
+  }
+
   /**
    * Logs once per header name why a header is not published, without its value, so the log never
    * holds record data.
@@ -275,9 +293,9 @@ public class CloudPubSubSinkTask extends SinkTask {
     if (value instanceof ByteBuffer) {
       return ByteString.copyFrom((ByteBuffer) value);
     }
-    // A top-level struct or map, including a JSON object read without a schema, with a field named
-    // by messageBodyName is split into the body and attributes; without one, the whole value is
-    // the body as JSON. Attributes are null for the body field itself.
+    // A top-level struct or map, including a JSON object read without a schema, is published whole
+    // as JSON when messageBodyName is not set, and split into body and attributes when it is.
+    // Attributes are null for the body field itself.
     if (attributes != null && value instanceof Struct) {
       return handleStruct((Struct) value, attributes);
     }
@@ -290,12 +308,16 @@ public class CloudPubSubSinkTask extends SinkTask {
   }
 
   /**
-   * Splits a struct: the field named by messageBodyName becomes the body and the others become
-   * attributes. A struct without that field is published whole, as JSON in the body.
+   * Publishes a struct whole, as JSON, when messageBodyName is not set. Otherwise splits it: the
+   * field named by messageBodyName becomes the body and the others become attributes; without that
+   * field, the body is empty.
    */
   private ByteString handleStruct(Struct struct, Map<String, String> attributes) {
-    if (struct.schema().field(messageBodyName) == null) {
+    if (!splitBody) {
       return toJson(struct.schema(), struct);
+    }
+    if (struct.schema().field(messageBodyName) == null) {
+      warnMissingBodyField();
     }
     ByteString msgBody = null;
     for (Field f : struct.schema().fields()) {
@@ -321,13 +343,16 @@ public class CloudPubSubSinkTask extends SinkTask {
   }
 
   /**
-   * Splits a map the way a struct is split: the entry named by messageBodyName becomes the body and
-   * the others become attributes. A map without that entry is published whole, as JSON in the
-   * body. The schema is null for schemaless JSON.
+   * Handles a map the way a struct is handled: published whole, as JSON, when messageBodyName is
+   * not set; otherwise the entry named by messageBodyName becomes the body and the others become
+   * attributes. The schema is null for schemaless JSON.
    */
   private ByteString handleMap(Schema schema, Map<?, ?> map, Map<String, String> attributes) {
-    if (!map.containsKey(messageBodyName)) {
+    if (!splitBody) {
       return toJson(schema, map);
+    }
+    if (!map.containsKey(messageBodyName)) {
+      warnMissingBodyField();
     }
     Schema valueSchema = schema == null ? null : schema.valueSchema();
     ByteString mapBody = null;
