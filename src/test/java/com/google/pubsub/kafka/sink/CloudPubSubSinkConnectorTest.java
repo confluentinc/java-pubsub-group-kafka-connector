@@ -16,11 +16,16 @@
 package com.google.pubsub.kafka.sink;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import com.google.pubsub.kafka.common.ConnectorUtils;
+import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.BehaviorOnError;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.apache.kafka.common.config.Config;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.ConfigValue;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -55,5 +60,60 @@ public class CloudPubSubSinkConnectorTest {
   @Test
   public void testTaskClass() {
     assertEquals(CloudPubSubSinkTask.class, connector.taskClass());
+  }
+
+  @Test
+  public void testBehaviorOnErrorDefaultsToFail() {
+    Map<String, Object> parsed = connector.config().parse(props);
+    assertEquals("fail", parsed.get(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR));
+  }
+
+  @Test
+  public void testBehaviorOnErrorIgnoresCase() {
+    props.put(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR, "LOG");
+    Map<String, Object> parsed = connector.config().parse(props);
+    assertEquals(
+        BehaviorOnError.LOG,
+        BehaviorOnError.getEnum((String) parsed.get(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR)));
+  }
+
+  @Test(expected = ConfigException.class)
+  public void testInvalidBehaviorOnError() {
+    props.put(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR, "dlq");
+    connector.config().parse(props);
+  }
+
+  @Test
+  public void testRetryBackoffMsDefault() {
+    Map<String, Object> parsed = connector.config().parse(props);
+    assertEquals(5, parsed.get(CloudPubSubSinkConnector.RETRY_BACKOFF_MS));
+  }
+
+  @Test(expected = ConfigException.class)
+  public void testRetryBackoffMsMustBePositive() {
+    props.put(CloudPubSubSinkConnector.RETRY_BACKOFF_MS, "0");
+    connector.config().parse(props);
+  }
+
+  @Test
+  public void testValidateRejectsRetryBackoffNotLessThanTotalTimeout() {
+    props.put(CloudPubSubSinkConnector.RETRY_BACKOFF_MS, "60000");
+    Config config = connector.validate(props);
+    assertEquals(1, errorsFor(config, CloudPubSubSinkConnector.RETRY_BACKOFF_MS).size());
+  }
+
+  @Test
+  public void testValidateAcceptsDefaultRetrySettings() {
+    Config config = connector.validate(props);
+    assertTrue(errorsFor(config, CloudPubSubSinkConnector.RETRY_BACKOFF_MS).isEmpty());
+  }
+
+  private static List<String> errorsFor(Config config, String name) {
+    for (ConfigValue value : config.configValues()) {
+      if (value.name().equals(name)) {
+        return value.errorMessages();
+      }
+    }
+    throw new AssertionError("No config value for " + name);
   }
 }

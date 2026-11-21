@@ -22,10 +22,12 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.connect.connector.Task;
 import org.apache.kafka.connect.sink.SinkConnector;
 import org.slf4j.Logger;
@@ -54,6 +56,10 @@ public class CloudPubSubSinkConnector extends SinkConnector {
   public static final int DEFAULT_DELAY_THRESHOLD_MS = 100;
   public static final int DEFAULT_REQUEST_TIMEOUT_MS = 10000;
   public static final int DEFAULT_TOTAL_TIMEOUT_MS = 60000;
+  public static final String BEHAVIOR_ON_ERROR = "behavior.on.error";
+  public static final String DEFAULT_BEHAVIOR_ON_ERROR = "fail";
+  public static final String RETRY_BACKOFF_MS = "retry.backoff.ms";
+  public static final int DEFAULT_RETRY_BACKOFF_MS = 5;
   public static final int DEFAULT_SHUTDOWN_TIMEOUT_MS = 60000;
   public static final long DEFAULT_MAX_OUTSTANDING_REQUEST_BYTES = Long.MAX_VALUE;
   public static final long DEFAULT_MAX_OUTSTANDING_MESSAGES = Long.MAX_VALUE;
@@ -65,6 +71,48 @@ public class CloudPubSubSinkConnector extends SinkConnector {
   public static final String DEFAULT_ORDERING_KEY_SOURCE = "none";
   public static final boolean DEFAULT_ENABLE_COMPRESSION = false;
   public static final long DEFAULT_COMPRESSION_BYTES_THRESHOLD = 240L;
+
+  /** Defines the accepted values for the {@link #BEHAVIOR_ON_ERROR}. */
+  public enum BehaviorOnError {
+    FAIL("fail"),
+    LOG("log"),
+    IGNORE("ignore");
+
+    private String value;
+
+    BehaviorOnError(String value) {
+      this.value = value;
+    }
+
+    public String toString() {
+      return value;
+    }
+
+    /** Returns the value with the given name, ignoring case, or null if there is none. */
+    public static BehaviorOnError getEnum(String value) {
+      for (BehaviorOnError behavior : BehaviorOnError.values()) {
+        if (behavior.value.equalsIgnoreCase(value)) {
+          return behavior;
+        }
+      }
+      return null;
+    }
+
+    /** Validator class for {@link CloudPubSubSinkConnector.BehaviorOnError}. */
+    public static class Validator implements ConfigDef.Validator {
+
+      @Override
+      public void ensureValid(String name, Object o) {
+        if (getEnum((String) o) == null) {
+          throw new ConfigException(
+              "Valid values for "
+                  + CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR
+                  + " are "
+                  + Arrays.toString(BehaviorOnError.values()));
+        }
+      }
+    }
+  }
 
   /** Defines the accepted values for the {@link #ORDERING_KEY_SOURCE}. */
   public enum OrderingKeySource {
@@ -205,7 +253,19 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             ConfigDef.Range.between(10000, Integer.MAX_VALUE),
             Importance.MEDIUM,
             "The maximum amount of time to wait for a publish to complete (including retries) in "
-                + "Cloud Pub/Sub.")
+                + "Cloud Pub/Sub. A record that still fails is then handled according to \""
+                + BEHAVIOR_ON_ERROR
+                + "\".")
+        .define(
+            RETRY_BACKOFF_MS,
+            Type.INT,
+            DEFAULT_RETRY_BACKOFF_MS,
+            ConfigDef.Range.between(1, Integer.MAX_VALUE),
+            Importance.LOW,
+            "How long to wait before the first retry of a failed publish to Cloud Pub/Sub. Each "
+                + "later retry waits twice as long as the one before, until \""
+                + MAX_TOTAL_TIMEOUT_MS
+                + "\" runs out.")
         .define(
             MAX_SHUTDOWN_TIMEOUT_MS,
             Type.INT,
@@ -295,9 +355,47 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             Type.BOOLEAN,
             false,
             Importance.LOW,
-            "When true, use the Pub/Sub emulator instead of the production service.");
+            "When true, use the Pub/Sub emulator instead of the production service.")
+        .define(
+            BEHAVIOR_ON_ERROR,
+            Type.STRING,
+            DEFAULT_BEHAVIOR_ON_ERROR,
+            new BehaviorOnError.Validator(),
+            Importance.MEDIUM,
+            "What to do with a record that cannot be published to Cloud Pub/Sub, because it cannot "
+                + "be converted, Pub/Sub rejects it, or publishing still fails after \""
+                + MAX_TOTAL_TIMEOUT_MS
+                + "\". \"fail\" stops the task. \"log\" logs the error and sends the record to "
+                + "the dead letter queue, if one is configured. \"ignore\" skips the record. "
+                + "Errors that are not specific to a record, such as a missing topic or "
+                + "permission, always stop the task.");
   }
 
   @Override
   public void stop() {}
+
+  /**
+   * Validates the configuration when the connector is created or changed. Besides the checks of
+   * each setting, this checks that a failed publish can be retried at least once.
+   */
+  @Override
+  public Config validate(Map<String, String> connectorConfigs) {
+    Config config = super.validate(connectorConfigs);
+    Map<String, ConfigValue> values = new HashMap<>();
+    for (ConfigValue value : config.configValues()) {
+      values.put(value.name(), value);
+    }
+    ConfigValue retryBackoff = values.get(RETRY_BACKOFF_MS);
+    ConfigValue totalTimeout = values.get(MAX_TOTAL_TIMEOUT_MS);
+    if (retryBackoff.errorMessages().isEmpty()
+        && totalTimeout.errorMessages().isEmpty()
+        && (Integer) retryBackoff.value() >= (Integer) totalTimeout.value()) {
+      retryBackoff.addErrorMessage(
+          RETRY_BACKOFF_MS
+              + " must be less than "
+              + MAX_TOTAL_TIMEOUT_MS
+              + ", otherwise a failed publish is never retried.");
+    }
+    return config;
+  }
 }
