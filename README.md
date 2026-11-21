@@ -219,6 +219,15 @@ configurations:
 | enableCompression          | Boolean                       | false                       | When true, enable [publish-side compression](https://cloud.google.com/pubsub/docs/publisher#compressing) in order to save on networking costs between Kafka Connect and  Cloud Pub/Sub.                                                                                                                                             |
 | compressionBytesThreshold  | Long                          | 240                         | When enableCompression is true, the minimum size of publish request (in bytes) to compress.
 
+When the sink connector is created or its configuration changes, Kafka Connect
+rejects the configuration if the credentials cannot be read. The connector also
+asks Pub/Sub whether the credentials may publish to the topic, and rejects the
+configuration if the key is not accepted, the topic does not exist, or the
+credentials lack the `pubsub.topics.publish` permission, which the
+`roles/pubsub.publisher` role grants. This check needs no other permission. It
+is skipped when `cps.useEmulator` is true, and for credentials other than
+service account and user keys.
+
 ### Pub/Sub Lite connector configs
 
 In addition to the Kafka Connect [configurations](https://kafka.apache.org/documentation.html#connect_configuring)

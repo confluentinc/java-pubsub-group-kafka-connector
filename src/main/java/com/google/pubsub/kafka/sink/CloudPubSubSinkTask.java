@@ -203,7 +203,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     enableCompression = (Boolean) validatedProps.get(CloudPubSubSinkConnector.ENABLE_COMPRESSION);
     compressionBytesThreshold =
         (Long) validatedProps.get(CloudPubSubSinkConnector.COMPRESSION_BYTES_THRESHOLD);
-    gcpCredentialsProvider = ConnectorCredentialsProvider.fromConfig(validatedProps);
+    gcpCredentialsProvider = ConnectorCredentialsProvider.fromConfig(validatedProps, props);
     reporter = getErrantRecordReporter();
     if (publisher == null) {
       // Only do this if we did not use the constructor.

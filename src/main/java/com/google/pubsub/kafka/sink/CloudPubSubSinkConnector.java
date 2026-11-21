@@ -15,13 +15,30 @@
  */
 package com.google.pubsub.kafka.sink;
 
+import com.google.api.gax.core.CredentialsProvider;
+import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.StatusCode;
+import com.google.auth.Credentials;
+import com.google.auth.oauth2.ServiceAccountCredentials;
+import com.google.auth.oauth2.UserCredentials;
+import com.google.cloud.pubsub.v1.TopicAdminClient;
+import com.google.cloud.pubsub.v1.TopicAdminSettings;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.iam.v1.TestIamPermissionsRequest;
+import com.google.pubsub.kafka.common.ConnectorCredentialsProvider;
 import com.google.pubsub.kafka.common.ConnectorUtils;
 import com.google.pubsub.kafka.common.Version;
+import com.google.pubsub.v1.ProjectTopicName;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.regex.Pattern;
 import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
@@ -56,10 +73,6 @@ public class CloudPubSubSinkConnector extends SinkConnector {
   public static final int DEFAULT_DELAY_THRESHOLD_MS = 100;
   public static final int DEFAULT_REQUEST_TIMEOUT_MS = 10000;
   public static final int DEFAULT_TOTAL_TIMEOUT_MS = 60000;
-  public static final String BEHAVIOR_ON_ERROR = "behavior.on.error";
-  public static final String DEFAULT_BEHAVIOR_ON_ERROR = "fail";
-  public static final String RETRY_BACKOFF_MS = "retry.backoff.ms";
-  public static final int DEFAULT_RETRY_BACKOFF_MS = 5;
   public static final int DEFAULT_SHUTDOWN_TIMEOUT_MS = 60000;
   public static final long DEFAULT_MAX_OUTSTANDING_REQUEST_BYTES = Long.MAX_VALUE;
   public static final long DEFAULT_MAX_OUTSTANDING_MESSAGES = Long.MAX_VALUE;
@@ -69,50 +82,25 @@ public class CloudPubSubSinkConnector extends SinkConnector {
   public static final String PUBLISH_KAFKA_HEADERS = "headers.publish";
   public static final String ORDERING_KEY_SOURCE = "orderingKeySource";
   public static final String DEFAULT_ORDERING_KEY_SOURCE = "none";
+  public static final String BEHAVIOR_ON_ERROR = "behavior.on.error";
+  public static final String DEFAULT_BEHAVIOR_ON_ERROR = "fail";
+  public static final String RETRY_BACKOFF_MS = "retry.backoff.ms";
+  public static final int DEFAULT_RETRY_BACKOFF_MS = 5;
   public static final boolean DEFAULT_ENABLE_COMPRESSION = false;
   public static final long DEFAULT_COMPRESSION_BYTES_THRESHOLD = 240L;
 
-  /** Defines the accepted values for the {@link #BEHAVIOR_ON_ERROR}. */
-  public enum BehaviorOnError {
-    FAIL("fail"),
-    LOG("log"),
-    IGNORE("ignore");
-
-    private String value;
-
-    BehaviorOnError(String value) {
-      this.value = value;
-    }
-
-    public String toString() {
-      return value;
-    }
-
-    /** Returns the value with the given name, ignoring case, or null if there is none. */
-    public static BehaviorOnError getEnum(String value) {
-      for (BehaviorOnError behavior : BehaviorOnError.values()) {
-        if (behavior.value.equalsIgnoreCase(value)) {
-          return behavior;
-        }
-      }
-      return null;
-    }
-
-    /** Validator class for {@link CloudPubSubSinkConnector.BehaviorOnError}. */
-    public static class Validator implements ConfigDef.Validator {
-
-      @Override
-      public void ensureValid(String name, Object o) {
-        if (getEnum((String) o) == null) {
-          throw new ConfigException(
-              "Valid values for "
-                  + CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR
-                  + " are "
-                  + Arrays.toString(BehaviorOnError.values()));
-        }
-      }
-    }
-  }
+  // The permission needed to publish, which the roles/pubsub.publisher role grants.
+  static final String PUBLISH_PERMISSION = "pubsub.topics.publish";
+  static final long PERMISSION_CHECK_TIMEOUT_MS = 10000;
+  // A config provider reference, such as ${file:/path:key}, that the worker could not resolve.
+  private static final Pattern CONFIG_PROVIDER_REFERENCE = Pattern.compile("\\$\\{.+}");
+  // The credentials settings, in the order ConnectorCredentialsProvider.fromConfig() prefers them.
+  private static final List<String> CREDENTIALS_CONFIGS =
+      Arrays.asList(
+          ConnectorUtils.GCP_SA_CREDENTIALS_FILE_PATH_CONFIG,
+          ConnectorUtils.GCP_SA_CREDENTIALS_JSON_CONFIG,
+          ConnectorUtils.GCP_CREDENTIALS_FILE_PATH_CONFIG,
+          ConnectorUtils.GCP_CREDENTIALS_JSON_CONFIG);
 
   /** Defines the accepted values for the {@link #ORDERING_KEY_SOURCE}. */
   public enum OrderingKeySource {
@@ -161,7 +149,83 @@ public class CloudPubSubSinkConnector extends SinkConnector {
     }
   }
 
+  /** Validator for {@link ConnectorUtils#GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG}. */
+  public static class CredentialsProviderClassValidator implements ConfigDef.Validator {
+
+    @Override
+    public void ensureValid(String name, Object o) {
+      String className = o == null ? "" : o.toString().trim();
+      if (className.isEmpty()) {
+        return;
+      }
+      try {
+        ConnectorCredentialsProvider.loadProviderClass(className);
+      } catch (IllegalArgumentException e) {
+        throw new ConfigException(name, className, e.getMessage());
+      }
+    }
+  }
+
+  /** Defines the accepted values for the {@link #BEHAVIOR_ON_ERROR}. */
+  public enum BehaviorOnError {
+    FAIL("fail"),
+    LOG("log"),
+    IGNORE("ignore");
+
+    private String value;
+
+    BehaviorOnError(String value) {
+      this.value = value;
+    }
+
+    public String toString() {
+      return value;
+    }
+
+    /** Returns the value with the given name, ignoring case, or null if there is none. */
+    public static BehaviorOnError getEnum(String value) {
+      for (BehaviorOnError behavior : BehaviorOnError.values()) {
+        if (behavior.value.equalsIgnoreCase(value)) {
+          return behavior;
+        }
+      }
+      return null;
+    }
+
+    /** Validator class for {@link CloudPubSubSinkConnector.BehaviorOnError}. */
+    public static class Validator implements ConfigDef.Validator {
+
+      @Override
+      public void ensureValid(String name, Object o) {
+        if (getEnum((String) o) == null) {
+          throw new ConfigException(
+              "Valid values for "
+                  + CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR
+                  + " are "
+                  + Arrays.toString(BehaviorOnError.values()));
+        }
+      }
+    }
+  }
+
+  /** Asks Pub/Sub whether credentials may publish to a topic. */
+  @VisibleForTesting
+  interface PublishPermissionCheck {
+    boolean canPublish(String endpoint, CredentialsProvider credentials, String topic)
+        throws IOException, ExecutionException, InterruptedException, TimeoutException;
+  }
+
+  private final PublishPermissionCheck publishPermissionCheck;
   private Map<String, String> props;
+
+  public CloudPubSubSinkConnector() {
+    this(CloudPubSubSinkConnector::canPublish);
+  }
+
+  @VisibleForTesting
+  CloudPubSubSinkConnector(PublishPermissionCheck publishPermissionCheck) {
+    this.publishPermissionCheck = publishPermissionCheck;
+  }
 
   @Override
   public String version() {
@@ -322,6 +386,18 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             Importance.HIGH,
             "The literal JSON content of the GCP Service Account (SA) key, passed as a string.")
         .define(
+            ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG,
+            Type.STRING,
+            "",
+            new CredentialsProviderClassValidator(),
+            Importance.LOW,
+            "The fully qualified name of a class that supplies the credentials, instead of a key. "
+                + "It must have a public no-arg constructor and either extend "
+                + "com.google.auth.oauth2.GoogleCredentials or implement "
+                + "com.google.api.gax.core.CredentialsProvider. If it implements "
+                + "org.apache.kafka.common.Configurable, it is configured with all of the "
+                + "connector's settings. When set, the key settings are ignored.")
+        .define(
             ORDERING_KEY_SOURCE,
             Type.STRING,
             DEFAULT_ORDERING_KEY_SOURCE,
@@ -329,6 +405,19 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             Importance.MEDIUM,
             "What to use to populate the Pub/Sub message ordering key. Possible values are "
                 + "\"none\", \"key\", or \"partition\".")
+        .define(
+            BEHAVIOR_ON_ERROR,
+            Type.STRING,
+            DEFAULT_BEHAVIOR_ON_ERROR,
+            new BehaviorOnError.Validator(),
+            Importance.MEDIUM,
+            "What to do with a record that cannot be published to Cloud Pub/Sub, because it cannot "
+                + "be converted, Pub/Sub rejects it, or publishing still fails after \""
+                + MAX_TOTAL_TIMEOUT_MS
+                + "\". \"fail\" stops the task. \"log\" logs the error and sends the record to "
+                + "the dead letter queue, if one is configured. \"ignore\" skips the record. "
+                + "Errors that are not specific to a record, such as a missing topic or "
+                + "permission, always stop the task.")
         .define(
             ENABLE_COMPRESSION,
             Type.BOOLEAN,
@@ -355,28 +444,13 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             Type.BOOLEAN,
             false,
             Importance.LOW,
-            "When true, use the Pub/Sub emulator instead of the production service.")
-        .define(
-            BEHAVIOR_ON_ERROR,
-            Type.STRING,
-            DEFAULT_BEHAVIOR_ON_ERROR,
-            new BehaviorOnError.Validator(),
-            Importance.MEDIUM,
-            "What to do with a record that cannot be published to Cloud Pub/Sub, because it cannot "
-                + "be converted, Pub/Sub rejects it, or publishing still fails after \""
-                + MAX_TOTAL_TIMEOUT_MS
-                + "\". \"fail\" stops the task. \"log\" logs the error and sends the record to "
-                + "the dead letter queue, if one is configured. \"ignore\" skips the record. "
-                + "Errors that are not specific to a record, such as a missing topic or "
-                + "permission, always stop the task.");
+            "When true, use the Pub/Sub emulator instead of the production service.");
   }
-
-  @Override
-  public void stop() {}
 
   /**
    * Validates the configuration when the connector is created or changed. Besides the checks of
-   * each setting, this checks that a failed publish can be retried at least once.
+   * each setting, this checks that the credentials can be read and asks Pub/Sub whether they may
+   * publish to the topic, so that these mistakes fail now rather than once records arrive.
    */
   @Override
   public Config validate(Map<String, String> connectorConfigs) {
@@ -396,6 +470,177 @@ public class CloudPubSubSinkConnector extends SinkConnector {
               + MAX_TOTAL_TIMEOUT_MS
               + ", otherwise a failed publish is never retried.");
     }
+    // The emulator needs no credentials.
+    if (!Boolean.TRUE.equals(values.get(ConnectorUtils.CPS_USE_EMULATOR).value())) {
+      validateCredentialsAndPermission(values);
+    }
     return config;
   }
+
+  /**
+   * Checks that the credentials can be read, then asks Pub/Sub whether they may publish to the
+   * topic.
+   */
+  private void validateCredentialsAndPermission(Map<String, ConfigValue> values) {
+    ConfigValue providerClass = values.get(ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG);
+    if (!providerClass.errorMessages().isEmpty()
+        || (providerClass.value() != null && !providerClass.value().toString().trim().isEmpty())) {
+      // The class can need settings or an environment, such as a Kubernetes service account
+      // token, that only the task has.
+      return;
+    }
+    Map<String, Object> credentialsConfigs = new HashMap<>();
+    String credentialsConfig = null;
+    for (String name : CREDENTIALS_CONFIGS) {
+      ConfigValue value = values.get(name);
+      if (!value.errorMessages().isEmpty()) {
+        return;
+      }
+      String text = value.value() == null ? "" : value.value().toString();
+      credentialsConfigs.put(name, text);
+      if (credentialsConfig == null && !text.isEmpty()) {
+        credentialsConfig = name;
+      }
+    }
+    if (ConnectorUtils.GCP_CREDENTIALS_FILE_PATH_CONFIG.equals(credentialsConfig)
+        && !credentialsConfigs
+            .get(ConnectorUtils.GCP_CREDENTIALS_JSON_CONFIG)
+            .toString()
+            .isEmpty()) {
+      String message =
+          "Set only one of "
+              + ConnectorUtils.GCP_CREDENTIALS_FILE_PATH_CONFIG
+              + " and "
+              + ConnectorUtils.GCP_CREDENTIALS_JSON_CONFIG
+              + ".";
+      values.get(ConnectorUtils.GCP_CREDENTIALS_FILE_PATH_CONFIG).addErrorMessage(message);
+      values.get(ConnectorUtils.GCP_CREDENTIALS_JSON_CONFIG).addErrorMessage(message);
+      return;
+    }
+    if (credentialsConfig != null
+        && CONFIG_PROVIDER_REFERENCE
+            .matcher(credentialsConfigs.get(credentialsConfig).toString())
+            .matches()) {
+      // Only a worker with that config provider can read the credentials.
+      return;
+    }
+    ConnectorCredentialsProvider credentials =
+        ConnectorCredentialsProvider.fromConfig(credentialsConfigs);
+    if (credentialsConfig != null) {
+      Credentials loaded;
+      try {
+        loaded = credentials.getCredentials();
+      } catch (IOException | RuntimeException e) {
+        // The exception's message is left out, because it can quote the key.
+        values
+            .get(credentialsConfig)
+            .addErrorMessage(unreadableCredentialsMessage(credentialsConfig));
+        return;
+      }
+      if (!(loaded instanceof ServiceAccountCredentials) && !(loaded instanceof UserCredentials)) {
+        // Other kinds of credentials can make the client fetch a token from a URL, file or program
+        // that they name, which validation does not do.
+        return;
+      }
+    }
+    ConfigValue project = values.get(ConnectorUtils.CPS_PROJECT_CONFIG);
+    ConfigValue topic = values.get(ConnectorUtils.CPS_TOPIC_CONFIG);
+    ConfigValue endpoint = values.get(ConnectorUtils.CPS_ENDPOINT);
+    if (!project.errorMessages().isEmpty()
+        || !topic.errorMessages().isEmpty()
+        || !endpoint.errorMessages().isEmpty()) {
+      return;
+    }
+    String topicName = ProjectTopicName.format((String) project.value(), (String) topic.value());
+    ConfigValue credentialsValue =
+        values.get(
+            credentialsConfig != null
+                ? credentialsConfig
+                : ConnectorUtils.GCP_CREDENTIALS_JSON_CONFIG);
+    String cannotCheck =
+        "Could not check whether the credentials can publish to " + topicName + ": ";
+    try {
+      if (!publishPermissionCheck.canPublish((String) endpoint.value(), credentials, topicName)) {
+        topic.addErrorMessage(
+            "The credentials cannot publish to "
+                + topicName
+                + ": the topic does not exist, or they lack the "
+                + PUBLISH_PERMISSION
+                + " permission, which the roles/pubsub.publisher role grants.");
+      }
+    } catch (ExecutionException | RuntimeException e) {
+      Throwable error = e instanceof ExecutionException && e.getCause() != null ? e.getCause() : e;
+      StatusCode.Code code =
+          error instanceof ApiException ? ((ApiException) error).getStatusCode().getCode() : null;
+      if (code == StatusCode.Code.UNAUTHENTICATED) {
+        credentialsValue.addErrorMessage(
+            "Pub/Sub did not accept the credentials. The key may have been deleted or disabled.");
+      } else if (code == StatusCode.Code.NOT_FOUND) {
+        topic.addErrorMessage("Topic " + topicName + " does not exist.");
+      } else {
+        topic.addErrorMessage(cannotCheck + CloudPubSubSinkTask.describe(error));
+      }
+    } catch (TimeoutException e) {
+      topic.addErrorMessage(
+          cannotCheck
+              + "Pub/Sub at "
+              + endpoint.value()
+              + " did not answer within "
+              + PERMISSION_CHECK_TIMEOUT_MS / 1000
+              + " seconds.");
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      topic.addErrorMessage(cannotCheck + "the check was interrupted.");
+    } catch (IOException e) {
+      // Reading the credentials failed, which with a key set was already checked above.
+      credentialsValue.addErrorMessage(
+          credentialsConfig != null
+              ? unreadableCredentialsMessage(credentialsConfig)
+              : "No credentials are set, and no application default credentials were found.");
+    }
+  }
+
+  private static String unreadableCredentialsMessage(String credentialsConfig) {
+    switch (credentialsConfig) {
+      case ConnectorUtils.GCP_SA_CREDENTIALS_FILE_PATH_CONFIG:
+      case ConnectorUtils.GCP_CREDENTIALS_FILE_PATH_CONFIG:
+        return "Could not read a Google Cloud credentials key from the file that "
+            + credentialsConfig
+            + " names.";
+      case ConnectorUtils.GCP_SA_CREDENTIALS_JSON_CONFIG:
+        return "The value of " + credentialsConfig + " is not a valid service account key.";
+      default:
+        return "The value of "
+            + credentialsConfig
+            + " is not a valid Google Cloud credentials key.";
+    }
+  }
+
+  /** Asks Pub/Sub whether the credentials have the publish permission on the topic. */
+  private static boolean canPublish(String endpoint, CredentialsProvider credentials, String topic)
+      throws IOException, ExecutionException, InterruptedException, TimeoutException {
+    TopicAdminSettings settings =
+        TopicAdminSettings.newBuilder()
+            .setEndpoint(endpoint)
+            .setCredentialsProvider(credentials)
+            .build();
+    try (TopicAdminClient client = TopicAdminClient.create(settings)) {
+      // Unlike reading the topic, which roles/pubsub.publisher does not allow, this call needs no
+      // permission of its own.
+      TestIamPermissionsRequest request =
+          TestIamPermissionsRequest.newBuilder()
+              .setResource(topic)
+              .addPermissions(PUBLISH_PERMISSION)
+              .build();
+      return client
+          .testIamPermissionsCallable()
+          .futureCall(request)
+          .get(PERMISSION_CHECK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+          .getPermissionsList()
+          .contains(PUBLISH_PERMISSION);
+    }
+  }
+
+  @Override
+  public void stop() {}
 }
