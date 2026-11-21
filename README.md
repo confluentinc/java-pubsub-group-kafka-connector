@@ -206,16 +206,27 @@ configurations:
 | maxOutstandingMessages     | Long                          | Long.MAX_VALUE              | The maximum number of messages that can be outstanding (including incomplete and pending batches) before the publisher will block further publishing.                                                                                                                                                                               |
 | maxDelayThresholdMs        | Integer                       | 100                         | The maximum amount of time to wait to reach maxBufferSize or maxBufferBytes before publishing outstanding messages to Pub/Sub.                                                                                                                                                                                                      |
 | maxRequestTimeoutMs        | Integer                       | 10,000                      | The timeout for individual publish requests to Pub/Sub.                                                                                                                                                                                                                                                                             |
-| maxTotalTimeoutMs          | Integer                       | 60,000                      | The total timeout for a call to publish (including retries) to Pub/Sub.                                                                                                                                                                                                                                                             |
+| maxTotalTimeoutMs          | Integer                       | 60,000                      | The total timeout for a call to publish (including retries) to Pub/Sub. A record that still fails is then handled according to behavior.on.error. |
+| retry.backoff.ms           | Integer                       | 5                           | How long to wait, in milliseconds, before the first retry of a failed publish. Each later retry waits twice as long as the one before, until maxTotalTimeoutMs runs out. Must be less than maxTotalTimeoutMs. |
 | maxShutdownTimeoutMs       | Integer                       | 60,000                      | The maximum amount of time to wait for a publisher to shutdown when stopping task in Kafka Connect.                                                                                                                                                                                                                                 |
 | gcp.credentials.file.path  | String                        | Optional                    | The filepath, which stores GCP credentials. If not defined, GOOGLE_APPLICATION_CREDENTIALS env is used.                                                                                                                                                                                                                             |
 | gcp.credentials.json       | String                        | Optional                    | GCP credentials JSON blob. If specified, use the explicitly handed credentials. Consider using the externalized secrets feature in Kafka Connect for passing the value.                                                                                                                                                             |
 | metadata.publish           | Boolean                       | false                       | When true, include the Kafka topic, partition, offset, and timestamp as message attributes when a message is published to Pub/Sub.                                                                                                                                                                                                  |
-| headers.publish            | Boolean                       | false                       | When true, include any headers as attributes when a message is published to Pub/Sub.                                                                                                                                                                                                                                                |
+| headers.publish            | Boolean                       | false                       | When true, include any headers as attributes when a message is published to Pub/Sub. A header with a null value is skipped, and a header never replaces the key, metadata or a field attribute. Headers left out are logged at WARN once per header name. |
 | orderingKeySource          | String (none, key, partition) | none                        | When set to "none", do not set the ordering key. When set to "key", uses a message's key as the ordering key. If set to "partition", converts the partition number to a String and uses that as the ordering key. Note that using "partition" should only be used for low-throughput topics or topics with thousands of partitions. |
-| messageBodyName            | String                        | "cps_message_body"          | When using a struct or map value schema, this field or key name indicates that the corresponding value will go into the Pub/Sub message body.                                                                                                                                                                                       |
+| behavior.on.error          | String (fail, log, ignore)    | fail                        | What to do with a record that cannot be published: it cannot be converted, Pub/Sub rejects it, or publishing still fails after maxTotalTimeoutMs. "fail" stops the task. "log" logs the error and sends the record to the dead letter queue set by errors.deadletterqueue.topic.name, if any; to continue past such records, errors.tolerance must be "all". "ignore" skips the record. Errors that are not specific to a record, such as a missing topic or permission, always stop the task. |
+| messageBodyName            | String                        | ""                          | For a struct or map value, the top-level field or key whose value becomes the Pub/Sub message body; the other fields become attributes, and a record without that field gets an empty body. When empty (the default), the whole value is published as JSON in the message body. |
 | enableCompression          | Boolean                       | false                       | When true, enable [publish-side compression](https://cloud.google.com/pubsub/docs/publisher#compressing) in order to save on networking costs between Kafka Connect and  Cloud Pub/Sub.                                                                                                                                             |
 | compressionBytesThreshold  | Long                          | 240                         | When enableCompression is true, the minimum size of publish request (in bytes) to compress.
+
+When the sink connector is created or its configuration changes, Kafka Connect
+rejects the configuration if the credentials cannot be read. The connector also
+asks Pub/Sub whether the credentials may publish to the topic, and rejects the
+configuration if the key is not accepted, the topic does not exist, or the
+credentials lack the `pubsub.topics.publish` permission, which the
+`roles/pubsub.publisher` role grants. This check needs no other permission. It
+is skipped when `cps.useEmulator` is true, and for credentials other than
+service account and user keys.
 
 ### Pub/Sub Lite connector configs
 
@@ -268,21 +279,36 @@ Additionally, a Pub/Sub message cannot exceed 10 MB. We recommend checking your
 
 The sink connector handles message conversion in the following way:
 
-* Integer, float, string, and bytes types in Kafka messages are passed
-  directly into the Pub/Sub message body as bytes.
-* Map and struct types in Kafka messages are stored as Pub/Sub attributes.
-  Pub/Sub attributes only supports string to string mapping. To make the
-  connector as versatile as possible, the `toString()` method is called on
-  objects passed in as the key or value for a map and the value for a struct.
-  * If you set the `messageBodyName` configuration to a struct field or map
-    key, the value of the structure field or the map value (of integer, byte,
-    float, and array type) will be stored in the Pub/Sub message body as bytes.
-* Only primitive array types are supported due to potential collisions
-  of field names or keys of a struct/map array. The connector handles arrays in
-  a fairly predictable fashion, where values are concatenated into a ByteString
-  object.
+* Strings are passed into the Pub/Sub message body as UTF-8 and bytes as they
+  are. Numbers, booleans, decimals, dates, times and timestamps are passed as
+  UTF-8 text, such as `45`, `true`, `12.50` or `2024-11-04T11:00:00.000Z`.
+* Arrays are passed into the message body as JSON.
+* Map and struct types in Kafka messages, and JSON objects read without a
+  schema, depend on the `messageBodyName` configuration:
+  * When `messageBodyName` is not set (the default), the whole value becomes
+    the message body as JSON, and its fields are not added as attributes. In
+    the JSON, dates are days since 1970, times are milliseconds since
+    midnight, timestamps are milliseconds since 1970, and decimals are
+    numbers, as in Kafka's JSON converter.
+  * When `messageBodyName` is set to a top-level field or key name, the value
+    is split: that field is converted as above and becomes the message body (a
+    nested struct or map in it becomes JSON), and every other top-level field
+    or key becomes an attribute. A record without that field gets an empty
+    body, and the connector logs a WARN once per topic. Pub/Sub attributes are
+    strings, so strings and numbers become their text, bytes become base64,
+    dates and times become ISO 8601 text in UTC, and nested structs, maps and
+    arrays become JSON. Fields whose value is null are left out.
+  * Before this change, `messageBodyName` defaulted to `cps_message_body`. To
+    keep that behaviour, set `messageBodyName=cps_message_body`.
 * The record-level key for a Kafka message is stored in Pub/Sub message
-  attributes as a string, with the name "key".
+  attributes with the name "key", converted the same way as a field. It is also
+  the ordering key when `orderingKeySource` is `key`.
+* When `headers.publish` is true, each record header becomes an attribute of
+  the same name. A header with a null value is skipped, and a header never
+  replaces the key, metadata or a field attribute: the record's own attribute
+  is kept and the header is left out. A header left out this way, or because
+  of the limits below, is logged at WARN once per header name; the record is
+  still published.
 
 > **Note:** Pub/Sub message attributes have the following
 > [limitations](https://cloud.google.com/pubsub/quotas#resource_limits):
