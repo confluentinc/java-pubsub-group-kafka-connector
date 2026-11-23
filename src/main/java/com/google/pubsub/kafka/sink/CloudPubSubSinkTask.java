@@ -33,23 +33,33 @@ import com.google.pubsub.kafka.common.ConnectorUtils;
 import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.OrderingKeySource;
 import com.google.pubsub.v1.ProjectTopicName;
 import com.google.pubsub.v1.PubsubMessage;
+import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.Schema.Type;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Time;
+import org.apache.kafka.connect.data.Values;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.header.ConnectHeaders;
 import org.apache.kafka.connect.header.Header;
+import org.apache.kafka.connect.json.DecimalFormat;
+import org.apache.kafka.connect.json.JsonConverter;
+import org.apache.kafka.connect.json.JsonConverterConfig;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.slf4j.Logger;
@@ -86,6 +96,11 @@ public class CloudPubSubSinkTask extends SinkTask {
   private long compressionBytesThreshold;
   private ConnectorCredentialsProvider gcpCredentialsProvider;
   private com.google.cloud.pubsub.v1.Publisher publisher;
+  private final JsonConverter jsonConverter = createJsonConverter();
+  // True when messageBodyName is set, so struct and map values are split into body and attributes.
+  private boolean splitBody;
+  // The record being converted, so a warning can say where it is.
+  private SinkRecord currentRecord;
 
   /** Holds a list of the publishing futures that have not been processed for a single partition. */
   private class OutstandingFuturesForPartition {
@@ -134,6 +149,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     maxShutdownTimeoutMs =
         (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_SHUTDOWN_TIMEOUT_MS);
     messageBodyName = (String) validatedProps.get(CloudPubSubSinkConnector.CPS_MESSAGE_BODY_NAME);
+    splitBody = messageBodyName != null && !messageBodyName.trim().isEmpty();
     includeMetadata = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_METADATA);
     includeHeaders = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS);
     orderingKeySource =
@@ -156,11 +172,12 @@ public class CloudPubSubSinkTask extends SinkTask {
     for (SinkRecord record : sinkRecords) {
       log.trace("Received record: " + record.toString());
       Map<String, String> attributes = new HashMap<>();
+      currentRecord = record;
       ByteString value = handleValue(record.valueSchema(), record.value(), attributes);
       String key = null;
       String partition = record.kafkaPartition().toString();
       if (record.key() != null) {
-        key = record.key().toString();
+        key = toAttributeValue(record.keySchema(), record.key());
         attributes.put(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key);
       }
       if (includeMetadata) {
@@ -172,8 +189,18 @@ public class CloudPubSubSinkTask extends SinkTask {
         }
       }
       if (includeHeaders) {
+        // A header never replaces an attribute set from the record's value, key or metadata.
+        Set<String> recordAttributes = new HashSet<>(attributes.keySet());
         for (Header header : getRecordHeaders(record)) {
-          attributes.put(header.key(), header.value().toString());
+          if (recordAttributes.contains(header.key())) {
+            warnDroppedHeader(
+                record,
+                header.key(),
+                "the message already has an attribute with that name; the record is published"
+                    + " without the header");
+            continue;
+          }
+          attributes.put(header.key(), headerText(header));
         }
       }
       if (attributes.isEmpty() && (value == null || value.isEmpty())) {
@@ -204,131 +231,231 @@ public class CloudPubSubSinkTask extends SinkTask {
     if (record.headers() != null) {
       int headerCount = 0;
       for (Header header : record.headers()) {
-        if (header.key().getBytes().length < 257
-            && String.valueOf(header.value()).getBytes().length < 1025) {
-          headers.add(header);
-          headerCount++;
+        if (header.value() == null) {
+          continue;
         }
         if (headerCount > 100) {
-          break;
+          warnDroppedHeader(
+              record,
+              header.key(),
+              "the record already has 101 headers, the most the connector publishes; Pub/Sub"
+                  + " rejects messages with more than 100 attributes");
+        } else if (header.key().getBytes(StandardCharsets.UTF_8).length >= 257) {
+          warnDroppedHeader(
+              record,
+              header.key(),
+              "its name is longer than 256 bytes; the record is published without the header");
+        } else if (headerText(header).getBytes(StandardCharsets.UTF_8).length >= 1025) {
+          warnDroppedHeader(
+              record,
+              header.key(),
+              "its value is longer than 1024 bytes; the record is published without the header");
+        } else {
+          headers.add(header);
+          headerCount++;
         }
       }
     }
     return headers;
   }
 
+  /** Logs that a record has no messageBodyName field, which may be a typo. */
+  private void warnMissingBodyField() {
+    log.warn(
+        "The record at topic {}, partition {}, offset {} has no field named {} (messageBodyName),"
+            + " so its message body is empty and all its fields are published as attributes.",
+        currentRecord.topic(),
+        currentRecord.kafkaPartition(),
+        currentRecord.kafkaOffset(),
+        messageBodyName);
+  }
+
+  /**
+   * Logs why a header is not published, with where the record is but not its key, value or the
+   * header's value, so the log never holds record data.
+   */
+  private static void warnDroppedHeader(SinkRecord record, String name, String reason) {
+    String shown = name.length() > 64 ? name.substring(0, 64) + "..." : name;
+    log.warn(
+        "Not publishing header {} of the record at topic {}, partition {}, offset {} as an"
+            + " attribute: {}.",
+        shown,
+        record.topic(),
+        record.kafkaPartition(),
+        record.kafkaOffset(),
+        reason);
+  }
+
+  /**
+   * Returns the text of a header for its attribute. Kafka Connect's header converter has already
+   * turned the header into a typed value, which Values writes back as text: on a worker in UTC,
+   * dates, JSON arrays and objects come out as they were sent. A value of a class Kafka Connect
+   * doesn't know, for example from a custom transform, falls back to its own text.
+   */
+  private static String headerText(Header header) {
+    try {
+      return Values.convertToString(header.schema(), header.value());
+    } catch (DataException e) {
+      return header.value().toString();
+    }
+  }
+
   private ByteString handleValue(Schema schema, Object value, Map<String, String> attributes) {
     if (value == null) {
       return null;
     }
-    if (schema == null) {
-      String str = value.toString();
-      return ByteString.copyFromUtf8(str);
+    if (value instanceof ByteString) {
+      return (ByteString) value;
     }
-    Schema.Type t = schema.type();
-    switch (t) {
-      case INT8:
-        byte b = (Byte) value;
-        byte[] arr = {b};
-        return ByteString.copyFrom(arr);
-      case INT16:
-        ByteBuffer shortBuf = ByteBuffer.allocate(2);
-        shortBuf.putShort((Short) value);
-        return ByteString.copyFrom(shortBuf);
-      case INT32:
-        ByteBuffer intBuf = ByteBuffer.allocate(4);
-        intBuf.putInt((Integer) value);
-        return ByteString.copyFrom(intBuf);
-      case INT64:
-        ByteBuffer longBuf = ByteBuffer.allocate(8);
-        longBuf.putLong((Long) value);
-        return ByteString.copyFrom(longBuf);
-      case FLOAT32:
-        ByteBuffer floatBuf = ByteBuffer.allocate(4);
-        floatBuf.putFloat((Float) value);
-        return ByteString.copyFrom(floatBuf);
-      case FLOAT64:
-        ByteBuffer doubleBuf = ByteBuffer.allocate(8);
-        doubleBuf.putDouble((Double) value);
-        return ByteString.copyFrom(doubleBuf);
-      case BOOLEAN:
-        byte bool = (byte) ((Boolean) value ? 1 : 0);
-        byte[] boolArr = {bool};
-        return ByteString.copyFrom(boolArr);
-      case STRING:
-        String str = (String) value;
-        return ByteString.copyFromUtf8(str);
-      case BYTES:
-        if (value instanceof ByteString) {
-          return (ByteString) value;
-        } else if (value instanceof byte[]) {
-          return ByteString.copyFrom((byte[]) value);
-        } else if (value instanceof ByteBuffer) {
-          return ByteString.copyFrom((ByteBuffer) value);
-        } else {
-          throw new DataException("Unexpected value class with BYTES schema type.");
-        }
-      case STRUCT:
-        Struct struct = (Struct) value;
-        ByteString msgBody = null;
-        for (Field f : schema.fields()) {
-          Schema.Type fieldType = f.schema().type();
-          if (fieldType == Type.MAP || fieldType == Type.STRUCT) {
-            throw new DataException(
-                "Struct type does not support nested Map or Struct types, "
-                    + "present in field "
-                    + f.name());
-          }
+    if (schema != null && schema.type().isPrimitive()) {
+      ConnectSchema.validateValue(schema, value);
+    }
+    if (value instanceof byte[]) {
+      return ByteString.copyFrom((byte[]) value);
+    }
+    if (value instanceof ByteBuffer) {
+      return ByteString.copyFrom((ByteBuffer) value);
+    }
+    // A top-level struct or map, including a JSON object read without a schema, is published whole
+    // as JSON when messageBodyName is not set, and split into body and attributes when it is.
+    // Attributes are null for the body field itself.
+    if (attributes != null && value instanceof Struct) {
+      return handleStruct((Struct) value, attributes);
+    }
+    if (attributes != null && value instanceof Map) {
+      return handleMap(schema, (Map<?, ?>) value, attributes);
+    }
+    // Strings, numbers, booleans, decimals and dates as text; nested structs, maps and arrays as
+    // JSON. The same text as in attributes.
+    return ByteString.copyFromUtf8(toAttributeValue(schema, value));
+  }
 
-          Object val = struct.get(f);
-          if (val == null) {
-            if (!f.schema().isOptional()) {
-              throw new DataException("Struct message missing required field " + f.name());
-            } else {
-              continue;
-            }
-          }
-          if (f.name().equals(messageBodyName)) {
-            Schema bodySchema = f.schema();
-            msgBody = handleValue(bodySchema, val, null);
-          } else {
-            attributes.put(f.name(), val.toString());
-          }
-        }
-        if (msgBody != null) {
-          return msgBody;
-        } else {
-          return ByteString.EMPTY;
-        }
-      case MAP:
-        Map<Object, Object> map = (Map<Object, Object>) value;
-        Set<Object> keys = map.keySet();
-        ByteString mapBody = null;
-        for (Object key : keys) {
-          if (key.equals(messageBodyName)) {
-            mapBody = ByteString.copyFromUtf8(map.get(key).toString());
-          } else {
-            attributes.put(key.toString(), map.get(key).toString());
-          }
-        }
-        if (mapBody != null) {
-          return mapBody;
-        } else {
-          return ByteString.EMPTY;
-        }
-      case ARRAY:
-        Schema.Type arrType = schema.valueSchema().type();
-        if (arrType == Type.MAP || arrType == Type.STRUCT) {
-          throw new DataException("Array type does not support Map or Struct types.");
-        }
-        ByteString out = ByteString.EMPTY;
-        Object[] objArr = (Object[]) value;
-        for (Object o : objArr) {
-          out = out.concat(handleValue(schema.valueSchema(), o, null));
-        }
-        return out;
+  /**
+   * Publishes a struct whole, as JSON, when messageBodyName is not set. Otherwise splits it: the
+   * field named by messageBodyName becomes the body and the others become attributes; without that
+   * field, the body is empty.
+   */
+  private ByteString handleStruct(Struct struct, Map<String, String> attributes) {
+    if (!splitBody) {
+      return toJson(struct.schema(), struct);
     }
-    return ByteString.EMPTY;
+    if (struct.schema().field(messageBodyName) == null) {
+      warnMissingBodyField();
+    }
+    ByteString msgBody = null;
+    for (Field f : struct.schema().fields()) {
+      Object val = struct.get(f);
+      if (val == null) {
+        if (!f.schema().isOptional()) {
+          throw new DataException("Struct message missing required field " + f.name());
+        } else {
+          continue;
+        }
+      }
+      if (f.name().equals(messageBodyName)) {
+        msgBody = handleValue(f.schema(), val, null);
+      } else {
+        attributes.put(f.name(), toAttributeValue(f.schema(), val));
+      }
+    }
+    if (msgBody != null) {
+      return msgBody;
+    } else {
+      return ByteString.EMPTY;
+    }
+  }
+
+  /**
+   * Handles a map the way a struct is handled: published whole, as JSON, when messageBodyName is
+   * not set; otherwise the entry named by messageBodyName becomes the body and the others become
+   * attributes. The schema is null for schemaless JSON.
+   */
+  private ByteString handleMap(Schema schema, Map<?, ?> map, Map<String, String> attributes) {
+    if (!splitBody) {
+      return toJson(schema, map);
+    }
+    if (!map.containsKey(messageBodyName)) {
+      warnMissingBodyField();
+    }
+    Schema valueSchema = schema == null ? null : schema.valueSchema();
+    ByteString mapBody = null;
+    for (Map.Entry<?, ?> entry : map.entrySet()) {
+      if (entry.getValue() == null) {
+        continue;
+      }
+      if (entry.getKey().equals(messageBodyName)) {
+        mapBody = handleValue(valueSchema, entry.getValue(), null);
+      } else {
+        if (valueSchema != null && valueSchema.type().isPrimitive()) {
+          // Unlike Struct.put, a map doesn't check its values against the schema. handleValue
+          // checks the body entry.
+          ConnectSchema.validateValue(entry.getKey().toString(), valueSchema, entry.getValue());
+        }
+        attributes.put(entry.getKey().toString(), toAttributeValue(valueSchema, entry.getValue()));
+      }
+    }
+    if (mapBody != null) {
+      return mapBody;
+    } else {
+      return ByteString.EMPTY;
+    }
+  }
+
+  /**
+   * Returns the text of a key or field for an attribute: JSON for structs, maps and arrays, ISO
+   * 8601 in UTC for dates and times, base64 for bytes, and plain text for anything else.
+   */
+  private String toAttributeValue(Schema schema, Object value) {
+    if (value instanceof Struct || value instanceof Map || value instanceof List) {
+      return toJson(schema, value).toStringUtf8();
+    }
+    if (value instanceof java.util.Date) {
+      return formatDate(schema, (java.util.Date) value);
+    }
+    if (value instanceof BigDecimal) {
+      return ((BigDecimal) value).toPlainString();
+    }
+    try {
+      return Values.convertToString(schema, value);
+    } catch (DataException e) {
+      if (schema != null) {
+        // The value doesn't match its schema. Fail with Connect's standard error, which names the
+        // expected type but, unlike the Values error, not the value itself.
+        ConnectSchema.validateValue(schema, value);
+      }
+      // Not a Kafka Connect type and no schema, so there is no standard text for it.
+      return value.toString();
+    }
+  }
+
+  /**
+   * Formats the Date, Time and Timestamp logical types as Values.convertToString() does, but in
+   * UTC: Values uses the worker's time zone and still ends the text with Z.
+   */
+  private static String formatDate(Schema schema, java.util.Date value) {
+    String name = schema == null ? null : schema.name();
+    String pattern = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
+    if (org.apache.kafka.connect.data.Date.LOGICAL_NAME.equals(name)) {
+      pattern = "yyyy-MM-dd";
+    } else if (Time.LOGICAL_NAME.equals(name)) {
+      pattern = "HH:mm:ss.SSS'Z'";
+    }
+    SimpleDateFormat format = new SimpleDateFormat(pattern);
+    format.setTimeZone(TimeZone.getTimeZone("UTC"));
+    return format.format(value);
+  }
+
+  private ByteString toJson(Schema schema, Object value) {
+    return ByteString.copyFrom(jsonConverter.fromConnectData(cpsTopic, schema, value));
+  }
+
+  private static JsonConverter createJsonConverter() {
+    Map<String, Object> config = new HashMap<>();
+    config.put(JsonConverterConfig.SCHEMAS_ENABLE_CONFIG, false);
+    config.put(JsonConverterConfig.DECIMAL_FORMAT_CONFIG, DecimalFormat.NUMERIC.name());
+    JsonConverter converter = new JsonConverter();
+    converter.configure(config, false);
+    return converter;
   }
 
   @Override
