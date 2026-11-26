@@ -20,14 +20,21 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutures;
+import com.google.api.core.SettableApiFuture;
+import com.google.api.gax.retrying.RetrySettings;
+import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.StatusCode;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.protobuf.ByteString;
 import com.google.pubsub.kafka.common.ConnectorUtils;
@@ -40,6 +47,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -52,11 +61,16 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.header.ConnectHeaders;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
+import org.threeten.bp.Duration;
 
 /** Tests for {@link CloudPubSubSinkTask}. */
 public class CloudPubSubSinkTaskTest {
@@ -127,6 +141,9 @@ public class CloudPubSubSinkTaskTest {
     }
   }
 
+  private SinkTaskContext context;
+  private ErrantRecordReporter reporter;
+
   @Before
   public void setup() {
     publisher = mock(Publisher.class, RETURNS_DEEP_STUBS);
@@ -135,6 +152,10 @@ public class CloudPubSubSinkTaskTest {
     props.put(ConnectorUtils.CPS_TOPIC_CONFIG, CPS_TOPIC);
     props.put(ConnectorUtils.CPS_PROJECT_CONFIG, CPS_PROJECT);
     props.put(CloudPubSubSinkConnector.MAX_BUFFER_SIZE_CONFIG, CPS_MIN_BATCH_SIZE2);
+    reporter = mock(ErrantRecordReporter.class);
+    when(reporter.report(any(), any())).thenReturn(CompletableFuture.completedFuture(null));
+    context = mock(SinkTaskContext.class);
+    when(context.errantRecordReporter()).thenReturn(reporter);
   }
 
   /** Tests that an exception is thrown when the schema of the value is not BYTES. */
@@ -649,17 +670,17 @@ public class CloudPubSubSinkTaskTest {
   }
 
   /**
-   * Tests that if a Future that is being processed in flush() failed with an exception and then a
-   * second Future is processed successfully in a subsequent flush, then the subsequent flush
-   * succeeds.
+   * Tests that if a Future that is being processed in flush() was rejected, behavior.on.error
+   * handles it, and a second Future is processed successfully in a subsequent flush.
    */
   @Test
   public void testFlushExceptionThenNoExceptionCase() throws Exception {
+    props.put(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR, "log");
     task.start(props);
     Map<TopicPartition, OffsetAndMetadata> partitionOffsets = new HashMap<>();
     partitionOffsets.put(new TopicPartition(KAFKA_TOPIC, 0), null);
     List<SinkRecord> records = getSampleRecords();
-    ApiFuture<String> badFuture = getFailedPublishFuture();
+    ApiFuture<String> badFuture = getFailedPublishFuture(invalidArgument());
     when(badFuture.isDone()).thenReturn(false);
     ApiFuture<String> goodFuture = getSuccessfulPublishFuture();
     when(goodFuture.isDone()).thenReturn(false);
@@ -668,10 +689,7 @@ public class CloudPubSubSinkTaskTest {
         .thenReturn(badFuture)
         .thenReturn(goodFuture);
     task.put(records);
-    try {
-      task.flush(partitionOffsets);
-    } catch (RuntimeException e) {
-    }
+    task.flush(partitionOffsets);
     records = getSampleRecords();
     task.put(records);
     task.flush(partitionOffsets);
@@ -894,7 +912,11 @@ public class CloudPubSubSinkTaskTest {
   }
 
   private ApiFuture<String> getFailedPublishFuture() {
-    SpyableFuture<String> future = new SpyableFuture(new Exception());
+    return getFailedPublishFuture(new Exception());
+  }
+
+  private ApiFuture<String> getFailedPublishFuture(Throwable error) {
+    SpyableFuture<String> future = new SpyableFuture(error);
     return spy(future);
   }
 
@@ -1310,5 +1332,440 @@ public class CloudPubSubSinkTaskTest {
   /** Returns the message the task publishes for a record with this value and no key. */
   private static PubsubMessage message(String value) {
     return PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8(value)).build();
+  }
+
+  /**
+   * Tests that a message that ran out of retries stops the task, even with behavior.on.error=log,
+   * and the messages cancelled behind it are not sent to the dead letter queue either.
+   */
+  @Test
+  public void testOutOfRetriesWithOrderingKeyFailsTask() {
+    props.put(CloudPubSubSinkConnector.ORDERING_KEY_SOURCE, "key");
+    startWithBehavior("log");
+    SinkRecord first = record(0, 1, KAFKA_MESSAGE_KEY1, "a");
+    SinkRecord second = record(0, 2, KAFKA_MESSAGE_KEY1, "b");
+    PubsubMessage a = orderedMessage(KAFKA_MESSAGE_KEY1, "a");
+    PubsubMessage b = orderedMessage(KAFKA_MESSAGE_KEY1, "b");
+    when(publisher.publish(a)).thenReturn(failed(unavailable()));
+    when(publisher.publish(b)).thenReturn(failed(cancelled()));
+    task.put(Arrays.asList(first, second));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+    verify(publisher, times(1)).publish(a);
+    verify(publisher, times(1)).publish(b);
+    verify(reporter, never()).report(any(), any());
+  }
+
+  /**
+   * Tests that every message in a request Pub/Sub rejected goes to the dead letter queue, since
+   * Pub/Sub does not say which message was at fault, and none is published again.
+   */
+  @Test
+  public void testRejectedRequestIsSentToDeadLetterQueue() {
+    startWithBehavior("log");
+    SinkRecord first = record(0, 1, null, "a");
+    SinkRecord second = record(0, 2, null, "b");
+    when(publisher.publish(message("a"))).thenReturn(failed(invalidArgument()));
+    when(publisher.publish(message("b"))).thenReturn(failed(invalidArgument()));
+    task.put(Arrays.asList(first, second));
+    task.flush(partitions(0));
+    verify(publisher, times(1)).publish(message("a"));
+    verify(publisher, times(1)).publish(message("b"));
+    verify(reporter).report(same(first), any(DataException.class));
+    verify(reporter).report(same(second), any(DataException.class));
+  }
+
+  /**
+   * Tests that messages cancelled behind a rejected message with the same ordering key share its
+   * outcome, and that the ordering key is resumed for later messages.
+   */
+  @Test
+  public void testCancelledMessagesBehindRejectedMessageShareOutcome() {
+    props.put(CloudPubSubSinkConnector.ORDERING_KEY_SOURCE, "key");
+    startWithBehavior("log");
+    SinkRecord first = record(0, 1, KAFKA_MESSAGE_KEY1, "a");
+    SinkRecord second = record(0, 2, KAFKA_MESSAGE_KEY1, "b");
+    PubsubMessage a = orderedMessage(KAFKA_MESSAGE_KEY1, "a");
+    PubsubMessage b = orderedMessage(KAFKA_MESSAGE_KEY1, "b");
+    when(publisher.publish(a)).thenReturn(failed(invalidArgument()));
+    when(publisher.publish(b)).thenReturn(failed(cancelled()));
+    task.put(Arrays.asList(first, second));
+    task.flush(partitions(0));
+    verify(publisher).resumePublish(KAFKA_MESSAGE_KEY1);
+    verify(publisher, times(1)).publish(a);
+    verify(publisher, times(1)).publish(b);
+    verify(reporter).report(same(first), any(DataException.class));
+    verify(reporter).report(same(second), any(DataException.class));
+  }
+
+  /**
+   * Tests that a cancelled message without an ordering key, which the publisher never cancels on
+   * its own, stops the task instead of going to the dead letter queue.
+   */
+  @Test
+  public void testCancelledMessageWithoutOrderingKeyFailsTask() {
+    startWithBehavior("log");
+    when(publisher.publish(message("a"))).thenReturn(failed(cancelled()));
+    task.put(Collections.singletonList(record(0, 1, null, "a")));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+    verify(reporter, never()).report(any(), any());
+  }
+
+  /** Tests that close() forgets the publishes of the closed partitions. */
+  @Test
+  public void testCloseDropsPendingPublishes() {
+    task.start(props);
+    when(publisher.publish(any(PubsubMessage.class)))
+        .thenReturn(failed(apiError(StatusCode.Code.PERMISSION_DENIED, false)));
+    task.put(Collections.singletonList(record(0, 1, null, "a")));
+    task.close(Collections.singletonList(new TopicPartition(KAFKA_TOPIC, 0)));
+    assertEquals(0, task.pendingPublishCount());
+    task.flush(partitions(0));
+  }
+
+  /** Tests that a record that cannot be converted fails the task by default. */
+  @Test
+  public void testConversionErrorFailsTaskByDefault() {
+    task.start(props);
+    DataException e =
+        assertThrows(
+            DataException.class,
+            () -> task.put(Collections.singletonList(recordThatCannotBeConverted(7))));
+    assertTrue(
+        e.getMessage()
+            .startsWith(
+                "Failed to publish the record at topic brown, partition 0, offset 7 to "
+                    + "projects/quick/topics/the: it cannot be made into a valid Pub/Sub message: "
+                    + "Invalid Java object for schema with type STRING"));
+  }
+
+  /** Tests that with behavior.on.error=ignore, a record that cannot be converted is skipped. */
+  @Test
+  public void testConversionErrorWithIgnoreSkipsRecord() {
+    startWithBehavior("ignore");
+    task.put(Arrays.asList(recordThatCannotBeConverted(1), record(0, 2, null, "a")));
+    verify(reporter, never()).report(any(), any());
+    verify(publisher, times(1)).publish(any(PubsubMessage.class));
+  }
+
+  /**
+   * Tests that with behavior.on.error=log, a record that cannot be converted goes to the dead
+   * letter queue and the rest of the batch is published.
+   */
+  @Test
+  public void testConversionErrorWithLogIsSentToDeadLetterQueue() {
+    startWithBehavior("log");
+    SinkRecord bad = recordThatCannotBeConverted(1);
+    task.put(Arrays.asList(bad, record(0, 2, null, "a")));
+    verify(reporter).report(same(bad), any(DataException.class));
+    verify(publisher, times(1)).publish(any(PubsubMessage.class));
+    verify(publisher).publish(message("a"));
+  }
+
+  /**
+   * Tests that the task fails when the dead letter queue refuses a record during flush(), instead
+   * of the worker rewinding and retrying forever.
+   */
+  @Test
+  public void testDeadLetterQueueRefusalInFlushFailsTask() {
+    when(reporter.report(any(), any()))
+        .thenThrow(new ConnectException("Tolerance exceeded in error handler"));
+    startWithBehavior("log");
+    when(publisher.publish(any(PubsubMessage.class))).thenReturn(failed(invalidArgument()));
+    task.put(Collections.singletonList(record(0, 1, null, "a")));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+    assertThrows(
+        ConnectException.class, () -> task.put(Collections.singletonList(record(0, 2, null, "b"))));
+  }
+
+  /**
+   * Tests that the task fails when the dead letter queue refuses a record during put(), for example
+   * because errors.tolerance is none.
+   */
+  @Test
+  public void testDeadLetterQueueRefusalInPutFailsTask() {
+    when(reporter.report(any(), any()))
+        .thenThrow(new ConnectException("Tolerance exceeded in error handler"));
+    startWithBehavior("log");
+    assertThrows(
+        ConnectException.class,
+        () -> task.put(Collections.singletonList(recordThatCannotBeConverted(1))));
+  }
+
+  /**
+   * Tests that errors that are not specific to a record fail the task even with
+   * behavior.on.error=log, without sending anything to the dead letter queue.
+   */
+  @Test
+  public void testErrorsNotSpecificToRecordFailTask() {
+    Throwable[] errors = {
+      apiError(StatusCode.Code.NOT_FOUND, false),
+      apiError(StatusCode.Code.PERMISSION_DENIED, false),
+      apiError(StatusCode.Code.UNAUTHENTICATED, false),
+      apiError(StatusCode.Code.FAILED_PRECONDITION, false),
+      apiError(StatusCode.Code.UNIMPLEMENTED, false),
+      new Exception("unexpected")
+    };
+    for (Throwable error : errors) {
+      setup();
+      startWithBehavior("log");
+      when(publisher.publish(any(PubsubMessage.class))).thenReturn(failed(error));
+      task.put(Collections.singletonList(record(0, 1, null, "a")));
+      assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+      assertThrows(
+          ConnectException.class,
+          () -> task.put(Collections.singletonList(record(0, 2, null, "b"))));
+      verify(reporter, never()).report(any(), any());
+    }
+  }
+
+  /** Tests that a failed dead letter queue write during flush() fails the task. */
+  @Test
+  public void testFailedDeadLetterQueueWriteFailsTask() {
+    CompletableFuture<Void> failedWrite = new CompletableFuture<>();
+    failedWrite.completeExceptionally(new RuntimeException("dead letter queue unavailable"));
+    when(reporter.report(any(), any())).thenReturn(failedWrite);
+    startWithBehavior("log");
+    when(publisher.publish(any(PubsubMessage.class))).thenReturn(failed(invalidArgument()));
+    task.put(Collections.singletonList(record(0, 1, null, "a")));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+    assertThrows(
+        ConnectException.class, () -> task.put(Collections.singletonList(record(0, 2, null, "b"))));
+  }
+
+  /** Tests that flush() leaves the publishes of partitions it was not asked about for later. */
+  @Test
+  public void testFlushOnlyHandlesGivenPartitions() {
+    task.start(props);
+    when(publisher.publish(message("a"))).thenReturn(published());
+    when(publisher.publish(message("b")))
+        .thenReturn(failed(apiError(StatusCode.Code.PERMISSION_DENIED, false)));
+    task.put(Arrays.asList(record(0, 1, null, "a"), record(1, 1, null, "b")));
+    task.flush(partitions(0));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(1)));
+  }
+
+  /**
+   * Tests that flush() waits for a record whose topic an SMT renamed, because the worker commits
+   * its offset under the topic it was consumed from.
+   */
+  @Test
+  public void testFlushWaitsForRecordFromRenamedTopic() {
+    task.start(props);
+    SinkRecord renamed =
+        new SinkRecord(
+            "renamed",
+            0,
+            null,
+            null,
+            STRING_SCHEMA,
+            "a",
+            5,
+            null,
+            TimestampType.NO_TIMESTAMP_TYPE,
+            new ConnectHeaders(),
+            KAFKA_TOPIC,
+            0,
+            5);
+    when(publisher.publish(any(PubsubMessage.class)))
+        .thenReturn(failed(apiError(StatusCode.Code.PERMISSION_DENIED, false)));
+    task.put(Collections.singletonList(renamed));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+  }
+
+  /** Tests that a message Pub/Sub rejects on its own fails the task by default. */
+  @Test
+  public void testInvalidMessageFailsTaskByDefault() {
+    task.start(props);
+    when(publisher.publish(message("a"))).thenReturn(failed(invalidArgument()));
+    task.put(Collections.singletonList(record(0, 1, null, "a")));
+    DataException e = assertThrows(DataException.class, () -> task.flush(partitions(0)));
+    assertTrue(e.getMessage().contains("INVALID_ARGUMENT"));
+    assertThrows(
+        ConnectException.class, () -> task.put(Collections.singletonList(record(0, 2, null, "b"))));
+  }
+
+  /** Tests that behavior.on.error=log skips a record when no dead letter queue is configured. */
+  @Test
+  public void testLogWithoutDeadLetterQueueSkipsRecord() {
+    when(context.errantRecordReporter()).thenReturn(null);
+    startWithBehavior("log");
+    task.put(Arrays.asList(recordThatCannotBeConverted(1), record(0, 2, null, "a")));
+    verify(publisher, times(1)).publish(any(PubsubMessage.class));
+  }
+
+  /** Tests that a message that ran out of retries fails the task by default. */
+  @Test
+  public void testOutOfRetriesFailsTaskByDefault() {
+    task.start(props);
+    when(publisher.publish(any(PubsubMessage.class))).thenReturn(failed(unavailable()));
+    task.put(Collections.singletonList(record(0, 1, null, "a")));
+    assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+    assertThrows(
+        ConnectException.class, () -> task.put(Collections.singletonList(record(0, 2, null, "b"))));
+  }
+
+  /**
+   * Tests that running out of retries stops the task even with behavior.on.error=log or ignore,
+   * because nothing is wrong with the record: Pub/Sub was unavailable or throttling. Nothing is
+   * sent to the dead letter queue, and the error says the task publishes again when it restarts.
+   */
+  @Test
+  public void testOutOfRetriesFailsTaskWhateverBehaviorOnError() {
+    StatusCode.Code[] codes = {
+      StatusCode.Code.UNAVAILABLE,
+      StatusCode.Code.DEADLINE_EXCEEDED,
+      StatusCode.Code.RESOURCE_EXHAUSTED
+    };
+    for (String behavior : new String[] {"log", "ignore"}) {
+      for (StatusCode.Code code : codes) {
+        setup();
+        startWithBehavior(behavior);
+        when(publisher.publish(message("a"))).thenReturn(failed(apiError(code, true)));
+        task.put(Collections.singletonList(record(0, 1, null, "a")));
+        ConnectException e = assertThrows(ConnectException.class, () -> task.flush(partitions(0)));
+        assertEquals(
+            "Failed to publish the record at topic brown, partition 0, offset 1 to "
+                + "projects/quick/topics/the: publishing still failed after retrying for up to "
+                + "maxTotalTimeoutMs=60000 ms (retry.backoff.ms=5): "
+                + code
+                + " from Pub/Sub. The error is not specific to this record, so the task is"
+                + " stopping; when it restarts, it publishes again from the last committed offset.",
+            e.getMessage());
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(Collections.singletonList(record(0, 2, null, "b"))));
+        verify(reporter, never()).report(any(), any());
+        verify(publisher, times(1)).publish(message("a"));
+      }
+    }
+  }
+
+  /** Tests that put() forgets publishes that already succeeded, so their records can be freed. */
+  @Test
+  public void testPutForgetsSucceededPublishes() {
+    task.start(props);
+    when(publisher.publish(message("a"))).thenReturn(published());
+    when(publisher.publish(message("b"))).thenReturn(SettableApiFuture.<String>create());
+    task.put(Arrays.asList(record(0, 1, null, "a"), record(0, 2, null, "b")));
+    assertEquals(2, task.pendingPublishCount());
+    task.put(Collections.<SinkRecord>emptyList());
+    assertEquals(1, task.pendingPublishCount());
+  }
+
+  /** Tests that a worker older than Connect 2.6, which has no dead letter queue API, works. */
+  @Test
+  public void testWorkerWithoutDeadLetterQueueApi() {
+    when(context.errantRecordReporter()).thenThrow(new NoSuchMethodError());
+    startWithBehavior("log");
+    task.put(Arrays.asList(recordThatCannotBeConverted(1), record(0, 2, null, "a")));
+    verify(publisher, times(1)).publish(any(PubsubMessage.class));
+  }
+
+  /**
+   * Tests the default retry settings: the delays the sink always used, with each wait capped at 10
+   * seconds.
+   */
+  @Test
+  public void testRetrySettingsDefaults() {
+    task.start(props);
+    RetrySettings settings = task.buildRetrySettings();
+    assertEquals(Duration.ofMillis(5), settings.getInitialRetryDelay());
+    assertEquals(2.0, settings.getRetryDelayMultiplier(), 0);
+    assertEquals(Duration.ofSeconds(10), settings.getMaxRetryDelay());
+    assertEquals(Duration.ofMillis(60000), settings.getTotalTimeout());
+    assertEquals(Duration.ofSeconds(10), settings.getInitialRpcTimeout());
+    assertEquals(2.0, settings.getRpcTimeoutMultiplier(), 0);
+    assertEquals(Duration.ofMillis(10000), settings.getMaxRpcTimeout());
+  }
+
+  /** Tests that the publisher retries with the configured backoff and timeouts. */
+  @Test
+  public void testRetrySettingsUseConfiguredValues() {
+    props.put(CloudPubSubSinkConnector.RETRY_BACKOFF_MS, "250");
+    props.put(CloudPubSubSinkConnector.MAX_TOTAL_TIMEOUT_MS, "30000");
+    props.put(CloudPubSubSinkConnector.MAX_REQUEST_TIMEOUT_MS, "15000");
+    task.start(props);
+    RetrySettings settings = task.buildRetrySettings();
+    assertEquals(Duration.ofMillis(250), settings.getInitialRetryDelay());
+    assertEquals(Duration.ofSeconds(10), settings.getMaxRetryDelay());
+    assertEquals(Duration.ofMillis(30000), settings.getTotalTimeout());
+    assertEquals(Duration.ofMillis(15000), settings.getMaxRpcTimeout());
+  }
+
+  /** Tests that a retry.backoff.ms longer than the 10 second cap becomes the cap. */
+  @Test
+  public void testRetryDelayCapIsAtLeastRetryBackoff() {
+    props.put(CloudPubSubSinkConnector.RETRY_BACKOFF_MS, "15000");
+    task.start(props);
+    RetrySettings settings = task.buildRetrySettings();
+    assertEquals(Duration.ofMillis(15000), settings.getInitialRetryDelay());
+    assertEquals(Duration.ofMillis(15000), settings.getMaxRetryDelay());
+  }
+
+  /** Starts the task with the given behavior.on.error on a worker with a dead letter queue. */
+  private void startWithBehavior(String behaviorOnError) {
+    props.put(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR, behaviorOnError);
+    task.initialize(context);
+    task.start(props);
+  }
+
+  /** Returns the message the task publishes for a record with this key, ordered by key. */
+  private static PubsubMessage orderedMessage(String key, String value) {
+    return PubsubMessage.newBuilder()
+        .putAttributes(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key)
+        .setOrderingKey(key)
+        .setData(ByteString.copyFromUtf8(value))
+        .build();
+  }
+
+  private static Map<TopicPartition, OffsetAndMetadata> partitions(int... partitions) {
+    Map<TopicPartition, OffsetAndMetadata> partitionOffsets = new HashMap<>();
+    for (int partition : partitions) {
+      partitionOffsets.put(new TopicPartition(KAFKA_TOPIC, partition), null);
+    }
+    return partitionOffsets;
+  }
+
+  private static ApiFuture<String> published() {
+    return ApiFutures.immediateFuture("id");
+  }
+
+  private static ApiFuture<String> failed(Throwable error) {
+    return ApiFutures.immediateFailedFuture(error);
+  }
+
+  private static ApiException invalidArgument() {
+    return apiError(StatusCode.Code.INVALID_ARGUMENT, false);
+  }
+
+  private static ApiException unavailable() {
+    return apiError(StatusCode.Code.UNAVAILABLE, true);
+  }
+
+  /** The error the publisher gives messages behind a failed one with the same ordering key. */
+  private static CancellationException cancelled() {
+    return new CancellationException(
+        "Execution cancelled because executing previous runnable failed.");
+  }
+
+  private static ApiException apiError(StatusCode.Code code, boolean retryable) {
+    StatusCode statusCode =
+        new StatusCode() {
+          @Override
+          public Code getCode() {
+            return code;
+          }
+
+          @Override
+          public Object getTransportCode() {
+            return code;
+          }
+        };
+    return new ApiException(new Exception(code + " from Pub/Sub"), statusCode, retryable);
+  }
+
+  /** Returns a record whose value doesn't match its schema, so it can't be converted. */
+  private static SinkRecord recordThatCannotBeConverted(long offset) {
+    return new SinkRecord(KAFKA_TOPIC, 0, null, null, Schema.STRING_SCHEMA, 45, offset);
   }
 }
