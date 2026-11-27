@@ -271,9 +271,12 @@ public class CloudPubSubSinkTaskTest {
     task.put(Collections.singletonList(record));
   }
 
-  /** Tests that, when splitting, a map value that doesn't match its schema names its key. */
+  /**
+   * Tests that, when splitting, a map value that doesn't match its schema fails without naming its
+   * key or value, which are record data.
+   */
   @Test
-  public void testMapAttributeWithMismatchedValueNamesKey() {
+  public void testMapAttributeWithMismatchedValueOmitsKeyAndValue() {
     props.put(CloudPubSubSinkConnector.CPS_MESSAGE_BODY_NAME, "cps_message_body");
     task.start(props);
     Schema schema = SchemaBuilder.map(Schema.STRING_SCHEMA, Schema.INT32_SCHEMA).build();
@@ -283,7 +286,8 @@ public class CloudPubSubSinkTaskTest {
     SinkRecord record = new SinkRecord(null, -1, null, null, schema, val, -1);
     DataException e =
         assertThrows(DataException.class, () -> task.put(Collections.singletonList(record)));
-    assertTrue(e.getMessage(), e.getMessage().contains("count"));
+    assertTrue(e.getMessage(), e.getMessage().contains("INT32"));
+    assertFalse(e.getMessage(), e.getMessage().contains("count"));
     assertFalse(e.getMessage(), e.getMessage().contains("abc"));
   }
 

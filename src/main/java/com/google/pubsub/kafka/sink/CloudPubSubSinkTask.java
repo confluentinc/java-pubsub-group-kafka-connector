@@ -462,8 +462,9 @@ public class CloudPubSubSinkTask extends SinkTask {
       } else {
         if (valueSchema != null && valueSchema.type().isPrimitive()) {
           // Unlike Struct.put, a map doesn't check its values against the schema. handleValue
-          // checks the body entry.
-          ConnectSchema.validateValue(entry.getKey().toString(), valueSchema, entry.getValue());
+          // checks the body entry. The key is left out of the error: it is record data, and the
+          // error is logged when the record is skipped or sent to the dead letter queue.
+          ConnectSchema.validateValue(valueSchema, entry.getValue());
         }
         attributes.put(entry.getKey().toString(), toAttributeValue(valueSchema, entry.getValue()));
       }
