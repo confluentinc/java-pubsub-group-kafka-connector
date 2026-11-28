@@ -153,6 +153,23 @@ public class CloudPubSubSinkConnector extends SinkConnector {
     }
   }
 
+  /** Validator for {@link ConnectorUtils#GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG}. */
+  public static class CredentialsProviderClassValidator implements ConfigDef.Validator {
+
+    @Override
+    public void ensureValid(String name, Object o) {
+      String className = o == null ? "" : o.toString().trim();
+      if (className.isEmpty()) {
+        return;
+      }
+      try {
+        ConnectorCredentialsProvider.loadProviderClass(className);
+      } catch (IllegalArgumentException e) {
+        throw new ConfigException(name, className, e.getMessage());
+      }
+    }
+  }
+
   /** Defines the accepted values for the {@link #BEHAVIOR_ON_ERROR}. */
   public enum BehaviorOnError {
     FAIL("fail"),
@@ -359,6 +376,18 @@ public class CloudPubSubSinkConnector extends SinkConnector {
             Importance.HIGH,
             "The literal JSON content of the GCP Service Account (SA) key, passed as a string.")
         .define(
+            ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG,
+            Type.STRING,
+            "",
+            new CredentialsProviderClassValidator(),
+            Importance.LOW,
+            "The fully qualified name of a class that supplies the credentials, instead of a key. "
+                + "It must have a public no-arg constructor and either extend "
+                + "com.google.auth.oauth2.GoogleCredentials or implement "
+                + "com.google.api.gax.core.CredentialsProvider. If it implements "
+                + "org.apache.kafka.common.Configurable, it is configured with all of the "
+                + "connector's settings. When set, the key settings are ignored.")
+        .define(
             ORDERING_KEY_SOURCE,
             Type.STRING,
             DEFAULT_ORDERING_KEY_SOURCE,
@@ -446,6 +475,13 @@ public class CloudPubSubSinkConnector extends SinkConnector {
    * topic.
    */
   private void validateCredentialsAndPermission(Map<String, ConfigValue> values) {
+    ConfigValue providerClass = values.get(ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG);
+    if (!providerClass.errorMessages().isEmpty()
+        || (providerClass.value() != null && !providerClass.value().toString().trim().isEmpty())) {
+      // The class can need settings or an environment, such as a Kubernetes service account
+      // token, that only the task has.
+      return;
+    }
     Map<String, Object> credentialsConfigs = new HashMap<>();
     String credentialsConfig = null;
     for (String name : CREDENTIALS_CONFIGS) {

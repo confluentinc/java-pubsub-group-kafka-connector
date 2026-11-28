@@ -18,14 +18,19 @@ package com.google.pubsub.kafka.sink;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.google.api.gax.core.CredentialsProvider;
 import com.google.api.gax.grpc.GrpcStatusCode;
 import com.google.api.gax.rpc.ApiException;
 import com.google.api.gax.rpc.ApiExceptionFactory;
 import com.google.auth.Credentials;
+import com.google.auth.oauth2.AccessToken;
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.pubsub.kafka.common.ConnectorCredentialsProvider;
 import com.google.pubsub.kafka.common.ConnectorUtils;
 import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.BehaviorOnError;
 import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.PublishPermissionCheck;
 import io.grpc.Status;
+import java.io.IOException;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -37,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.config.Config;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.ConfigValue;
@@ -333,6 +339,87 @@ public class CloudPubSubSinkConnectorTest {
   private static ApiException apiError(Status.Code code) {
     return ApiExceptionFactory.createException(
         new Exception(code + " from Pub/Sub"), GrpcStatusCode.of(code), false);
+  }
+
+  /**
+   * Tests that a credentials provider class is checked but not used by validation, because it can
+   * need an environment that only the task has.
+   */
+  @Test
+  public void testValidateAcceptsCredentialsProviderClassWithoutCheckingPermission() {
+    props.put(
+        ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG, StubCredentials.class.getName());
+    assertEquals(Collections.emptyList(), allErrors(connector.validate(props)));
+    assertTrue(checkedTopics.isEmpty());
+  }
+
+  @Test
+  public void testValidateRejectsMissingCredentialsProviderClass() {
+    props.put(ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG, "com.example.Missing");
+    List<String> errors =
+        errorsFor(connector.validate(props), ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG);
+    assertEquals(1, errors.size());
+    assertTrue(errors.get(0), errors.get(0).contains("could not be loaded"));
+    assertTrue(checkedTopics.isEmpty());
+  }
+
+  @Test
+  public void testValidateRejectsCredentialsProviderClassOfWrongType() {
+    props.put(ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG, String.class.getName());
+    List<String> errors =
+        errorsFor(connector.validate(props), ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG);
+    assertEquals(1, errors.size());
+    assertTrue(errors.get(0), errors.get(0).contains("must extend"));
+  }
+
+  /**
+   * Tests that a configurable credentials class is configured with the original settings, including
+   * ones the connector does not define, and is preferred over a key.
+   */
+  @Test
+  public void testCredentialsProviderClassIsConfiguredWithOriginals() throws IOException {
+    props.put(
+        ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG, StubCredentials.class.getName());
+    props.put(ConnectorUtils.GCP_SA_CREDENTIALS_JSON_CONFIG, USER_KEY);
+    props.put("customer.gcp.service.account", "customer@example.iam.gserviceaccount.com");
+    Map<String, Object> parsed = connector.config().parse(props);
+
+    Credentials credentials =
+        ConnectorCredentialsProvider.fromConfig(parsed, props).getCredentials();
+
+    assertTrue(credentials instanceof StubCredentials);
+    assertEquals(
+        "customer@example.iam.gserviceaccount.com",
+        ((StubCredentials) credentials).configs.get("customer.gcp.service.account"));
+  }
+
+  @Test
+  public void testCredentialsProviderClassCanBeCredentialsProvider() throws IOException {
+    Map<String, Object> config = new HashMap<>();
+    config.put(ConnectorUtils.GCP_CREDENTIALS_PROVIDER_CLASS_CONFIG, StubProvider.class.getName());
+
+    Credentials credentials = ConnectorCredentialsProvider.fromConfig(config).getCredentials();
+
+    assertTrue(credentials instanceof GoogleCredentials);
+    assertEquals("stub-token", ((GoogleCredentials) credentials).getAccessToken().getTokenValue());
+  }
+
+  /** Configurable credentials that record the settings they are configured with. */
+  public static class StubCredentials extends GoogleCredentials implements Configurable {
+    Map<String, ?> configs;
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+      this.configs = configs;
+    }
+  }
+
+  /** A credentials provider that returns a fixed access token. */
+  public static class StubProvider implements CredentialsProvider {
+    @Override
+    public Credentials getCredentials() {
+      return GoogleCredentials.create(new AccessToken("stub-token", null));
+    }
   }
 
   private static List<String> allErrors(Config config) {
