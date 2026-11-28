@@ -19,17 +19,19 @@ import static com.google.pubsub.kafka.common.ConnectorUtils.getSystemExecutor;
 
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
-import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.batching.BatchingSettings;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.api.gax.batching.FlowController;
 import com.google.api.gax.core.FixedExecutorProvider;
 import com.google.api.gax.retrying.RetrySettings;
+import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.StatusCode;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
 import com.google.pubsub.kafka.common.ConnectorCredentialsProvider;
 import com.google.pubsub.kafka.common.ConnectorUtils;
+import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.BehaviorOnError;
 import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.OrderingKeySource;
 import com.google.pubsub.v1.ProjectTopicName;
 import com.google.pubsub.v1.PubsubMessage;
@@ -45,6 +47,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -54,12 +59,14 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.data.Time;
 import org.apache.kafka.connect.data.Values;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.header.ConnectHeaders;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.json.DecimalFormat;
 import org.apache.kafka.connect.json.JsonConverter;
 import org.apache.kafka.connect.json.JsonConverterConfig;
+import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.slf4j.Logger;
@@ -73,11 +80,14 @@ import org.threeten.bp.Duration;
 public class CloudPubSubSinkTask extends SinkTask {
   private static final Logger log = LoggerFactory.getLogger(CloudPubSubSinkTask.class);
 
-  // Maps a topic to another map which contains the outstanding futures per partition
-  private Map<String, Map<Integer, OutstandingFuturesForPartition>> allOutstandingFutures =
-      new HashMap<>();
+  // Maps each topic partition, as the worker commits its offsets, to the publishes that flush()
+  // has not handled yet.
+  private final Map<TopicPartition, List<PendingPublish>> pendingPublishes = new HashMap<>();
+  // Writes structs, maps and arrays as plain JSON, with decimals as numbers.
+  private final JsonConverter jsonConverter = createJsonConverter();
   private String cpsProject;
   private String cpsTopic;
+  private String fullTopicName;
   private String cpsEndpoint;
   private boolean useEmulator;
   private String messageBodyName;
@@ -88,23 +98,52 @@ public class CloudPubSubSinkTask extends SinkTask {
   private int maxDelayThresholdMs;
   private int maxRequestTimeoutMs;
   private int maxTotalTimeoutMs;
+  private int retryBackoffMs;
   private int maxShutdownTimeoutMs;
   private boolean includeMetadata;
   private boolean includeHeaders;
   private OrderingKeySource orderingKeySource;
+  private BehaviorOnError behaviorOnError;
   private boolean enableCompression;
   private long compressionBytesThreshold;
   private ConnectorCredentialsProvider gcpCredentialsProvider;
   private com.google.cloud.pubsub.v1.Publisher publisher;
-  private final JsonConverter jsonConverter = createJsonConverter();
+  private ErrantRecordReporter reporter;
+  // Set once a failure stops the task. Throwing from flush() only makes the worker rewind and send
+  // the records again, so put() and flush() keep throwing this to fail the task instead.
+  private ConnectException fatalError;
+  private boolean originalTopicSupported = true;
   // True when messageBodyName is set, so struct and map values are split into body and attributes.
   private boolean splitBody;
   // The record being converted, so a warning can say where it is.
   private SinkRecord currentRecord;
 
-  /** Holds a list of the publishing futures that have not been processed for a single partition. */
-  private class OutstandingFuturesForPartition {
-    public List<ApiFuture<String>> futures = new ArrayList<>();
+  /** A message handed to the publisher, and the record it was built from. */
+  private static class PendingPublish {
+    private final SinkRecord record;
+    private final PubsubMessage message;
+    private final ApiFuture<String> future;
+
+    PendingPublish(SinkRecord record, PubsubMessage message, ApiFuture<String> future) {
+      this.record = record;
+      this.message = message;
+      this.future = future;
+    }
+  }
+
+  /** How flush() handles a publish that failed. */
+  private enum PublishFailure {
+    /** Pub/Sub rejected the request the message was sent in. */
+    INVALID_MESSAGE,
+    /**
+     * The publisher retried a temporary error until the total timeout ran out. Nothing is wrong
+     * with the message, so it stops the task instead of going to the dead letter queue.
+     */
+    OUT_OF_RETRIES,
+    /** Never sent because an earlier message with the same ordering key failed. */
+    CANCELLED,
+    /** Not specific to the message, such as a missing topic or permission. */
+    FATAL
   }
 
   /**
@@ -133,6 +172,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     Map<String, Object> validatedProps = new CloudPubSubSinkConnector().config().parse(props);
     cpsProject = validatedProps.get(ConnectorUtils.CPS_PROJECT_CONFIG).toString();
     cpsTopic = validatedProps.get(ConnectorUtils.CPS_TOPIC_CONFIG).toString();
+    fullTopicName = ProjectTopicName.format(cpsProject, cpsTopic);
     cpsEndpoint = validatedProps.get(ConnectorUtils.CPS_ENDPOINT).toString();
     useEmulator = (Boolean) validatedProps.get(ConnectorUtils.CPS_USE_EMULATOR);
     maxBufferSize = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_SIZE_CONFIG);
@@ -146,6 +186,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     maxRequestTimeoutMs =
         (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_REQUEST_TIMEOUT_MS);
     maxTotalTimeoutMs = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_TOTAL_TIMEOUT_MS);
+    retryBackoffMs = (Integer) validatedProps.get(CloudPubSubSinkConnector.RETRY_BACKOFF_MS);
     maxShutdownTimeoutMs =
         (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_SHUTDOWN_TIMEOUT_MS);
     messageBodyName = (String) validatedProps.get(CloudPubSubSinkConnector.CPS_MESSAGE_BODY_NAME);
@@ -155,10 +196,14 @@ public class CloudPubSubSinkTask extends SinkTask {
     orderingKeySource =
         OrderingKeySource.getEnum(
             (String) validatedProps.get(CloudPubSubSinkConnector.ORDERING_KEY_SOURCE));
+    behaviorOnError =
+        BehaviorOnError.getEnum(
+            (String) validatedProps.get(CloudPubSubSinkConnector.BEHAVIOR_ON_ERROR));
     enableCompression = (Boolean) validatedProps.get(CloudPubSubSinkConnector.ENABLE_COMPRESSION);
     compressionBytesThreshold =
         (Long) validatedProps.get(CloudPubSubSinkConnector.COMPRESSION_BYTES_THRESHOLD);
     gcpCredentialsProvider = ConnectorCredentialsProvider.fromConfig(validatedProps);
+    reporter = getErrantRecordReporter();
     if (publisher == null) {
       // Only do this if we did not use the constructor.
       createPublisher();
@@ -166,64 +211,93 @@ public class CloudPubSubSinkTask extends SinkTask {
     log.info("Start CloudPubSubSinkTask");
   }
 
+  /** Returns the worker's dead letter queue reporter, or null if it has none. */
+  private ErrantRecordReporter getErrantRecordReporter() {
+    if (context == null) {
+      return null;
+    }
+    try {
+      return context.errantRecordReporter();
+    } catch (NoSuchMethodError | NoClassDefFoundError e) {
+      // Connect before 2.6 has no dead letter queue for connectors.
+      return null;
+    }
+  }
+
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
+    throwIfFailed();
+    forgetPublished();
     log.debug("Received " + sinkRecords.size() + " messages to send to CPS.");
     for (SinkRecord record : sinkRecords) {
       log.trace("Received record: " + record.toString());
-      Map<String, String> attributes = new HashMap<>();
-      currentRecord = record;
-      ByteString value = handleValue(record.valueSchema(), record.value(), attributes);
-      String key = null;
-      String partition = record.kafkaPartition().toString();
-      if (record.key() != null) {
-        key = toAttributeValue(record.keySchema(), record.key());
-        attributes.put(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key);
-      }
-      if (includeMetadata) {
-        attributes.put(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE, record.topic());
-        attributes.put(ConnectorUtils.KAFKA_PARTITION_ATTRIBUTE, partition);
-        attributes.put(ConnectorUtils.KAFKA_OFFSET_ATTRIBUTE, Long.toString(record.kafkaOffset()));
-        if (record.timestamp() != null) {
-          attributes.put(ConnectorUtils.KAFKA_TIMESTAMP_ATTRIBUTE, record.timestamp().toString());
-        }
-      }
-      if (includeHeaders) {
-        // A header never replaces an attribute set from the record's value, key or metadata.
-        Set<String> recordAttributes = new HashSet<>(attributes.keySet());
-        for (Header header : getRecordHeaders(record)) {
-          if (recordAttributes.contains(header.key())) {
-            warnDroppedHeader(
-                record,
-                header.key(),
-                "the message already has an attribute with that name; the record is published"
-                    + " without the header");
-            continue;
-          }
-          attributes.put(header.key(), headerText(header));
-        }
-      }
-      if (attributes.isEmpty() && (value == null || value.isEmpty())) {
-        log.warn("Message received with no value and no attributes. Not publishing message");
-        SettableApiFuture<String> nullMessageFuture = SettableApiFuture.<String>create();
-        nullMessageFuture.set("No message");
-        addPendingMessageFuture(record.topic(), record.kafkaPartition(), nullMessageFuture);
+      PubsubMessage message;
+      try {
+        message = buildMessage(record);
+      } catch (RuntimeException e) {
+        // A DataException explains itself; for anything else the exception class says what broke.
+        String reason = e instanceof DataException ? e.getMessage() : e.toString();
+        // The worker waits for dead letter queue writes made during put() before it commits.
+        handleFailedRecord(record, "it cannot be made into a valid Pub/Sub message: " + reason, e);
         continue;
       }
-      PubsubMessage.Builder builder = PubsubMessage.newBuilder();
-      builder.putAllAttributes(attributes);
-      if (value != null) {
-        builder.setData(value);
+      if (message == null) {
+        log.warn("Message received with no value and no attributes. Not publishing message");
+        continue;
       }
-      if (orderingKeySource == OrderingKeySource.KEY && key != null && !key.isEmpty()) {
-        builder.setOrderingKey(key);
-      } else if (orderingKeySource == OrderingKeySource.PARTITION) {
-        builder.setOrderingKey(partition);
-      }
-
-      PubsubMessage message = builder.build();
-      publishMessage(record.topic(), record.kafkaPartition(), message);
+      publishMessage(record, message);
     }
+  }
+
+  /** Builds the message for a record, or returns null if the record has nothing to publish. */
+  private PubsubMessage buildMessage(SinkRecord record) {
+    Map<String, String> attributes = new HashMap<>();
+    currentRecord = record;
+    ByteString value = handleValue(record.valueSchema(), record.value(), attributes);
+    String key = null;
+    String partition = record.kafkaPartition().toString();
+    if (record.key() != null) {
+      key = toAttributeValue(record.keySchema(), record.key());
+      attributes.put(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key);
+    }
+    if (includeMetadata) {
+      attributes.put(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE, record.topic());
+      attributes.put(ConnectorUtils.KAFKA_PARTITION_ATTRIBUTE, partition);
+      attributes.put(ConnectorUtils.KAFKA_OFFSET_ATTRIBUTE, Long.toString(record.kafkaOffset()));
+      if (record.timestamp() != null) {
+        attributes.put(ConnectorUtils.KAFKA_TIMESTAMP_ATTRIBUTE, record.timestamp().toString());
+      }
+    }
+    if (includeHeaders) {
+      // A header never replaces an attribute set from the record's value, key or metadata.
+      Set<String> recordAttributes = new HashSet<>(attributes.keySet());
+      for (Header header : getRecordHeaders(record)) {
+        if (recordAttributes.contains(header.key())) {
+          warnDroppedHeader(
+              record,
+              header.key(),
+              "the message already has an attribute with that name; the record is published"
+                  + " without the header");
+          continue;
+        }
+        attributes.put(header.key(), headerText(header));
+      }
+    }
+    if (attributes.isEmpty() && (value == null || value.isEmpty())) {
+      return null;
+    }
+    PubsubMessage.Builder builder = PubsubMessage.newBuilder();
+    builder.putAllAttributes(attributes);
+    if (value != null) {
+      builder.setData(value);
+    }
+    if (orderingKeySource == OrderingKeySource.KEY && key != null && !key.isEmpty()) {
+      builder.setOrderingKey(key);
+    } else if (orderingKeySource == OrderingKeySource.PARTITION) {
+      builder.setOrderingKey(partition);
+    }
+    PubsubMessage message = builder.build();
+    return message;
   }
 
   private Iterable<? extends Header> getRecordHeaders(SinkRecord record) {
@@ -388,8 +462,9 @@ public class CloudPubSubSinkTask extends SinkTask {
       } else {
         if (valueSchema != null && valueSchema.type().isPrimitive()) {
           // Unlike Struct.put, a map doesn't check its values against the schema. handleValue
-          // checks the body entry.
-          ConnectSchema.validateValue(entry.getKey().toString(), valueSchema, entry.getValue());
+          // checks the body entry. The key is left out of the error: it is record data, and the
+          // error is logged when the record is skipped or sent to the dead letter queue.
+          ConnectSchema.validateValue(valueSchema, entry.getValue());
         }
         attributes.put(entry.getKey().toString(), toAttributeValue(valueSchema, entry.getValue()));
       }
@@ -461,51 +536,293 @@ public class CloudPubSubSinkTask extends SinkTask {
   @Override
   public void flush(Map<TopicPartition, OffsetAndMetadata> partitionOffsets) {
     log.debug("Flushing...");
-    // Process results of all the outstanding futures specified by each TopicPartition.
-    for (Map.Entry<TopicPartition, OffsetAndMetadata> partitionOffset :
-        partitionOffsets.entrySet()) {
-      log.trace("Received flush for partition " + partitionOffset.getKey().toString());
-      Map<Integer, OutstandingFuturesForPartition> outstandingFuturesForTopic =
-          allOutstandingFutures.get(partitionOffset.getKey().topic());
-      if (outstandingFuturesForTopic == null) {
-        continue;
+    throwIfFailed();
+    List<PendingPublish> publishes = new ArrayList<>();
+    for (TopicPartition partition : partitionOffsets.keySet()) {
+      log.trace("Received flush for partition " + partition.toString());
+      List<PendingPublish> publishesForPartition = pendingPublishes.remove(partition);
+      if (publishesForPartition != null) {
+        publishes.addAll(publishesForPartition);
       }
-      OutstandingFuturesForPartition outstandingFutures =
-          outstandingFuturesForTopic.get(partitionOffset.getKey().partition());
-      if (outstandingFutures == null) {
-        continue;
+    }
+    try {
+      List<Future<Void>> deadLetterWrites = new ArrayList<>();
+      handlePublishResults(publishes, deadLetterWrites);
+      waitForDeadLetterWrites(deadLetterWrites);
+    } catch (RuntimeException e) {
+      fatalError = e instanceof ConnectException ? (ConnectException) e : new ConnectException(e);
+      throw fatalError;
+    }
+  }
+
+  @Override
+  public void close(Collection<TopicPartition> partitions) {
+    // flush() has already handled these partitions, unless the worker lost them without a commit.
+    // Their records are then redelivered to the task that takes the partitions over.
+    for (TopicPartition partition : partitions) {
+      pendingPublishes.remove(partition);
+    }
+  }
+
+  private void throwIfFailed() {
+    if (fatalError != null) {
+      throw fatalError;
+    }
+  }
+
+  /**
+   * Forgets the publishes that already succeeded, so that their records and messages are not kept
+   * until the next flush().
+   */
+  private void forgetPublished() {
+    for (List<PendingPublish> publishes : pendingPublishes.values()) {
+      publishes.removeIf(publish -> publish.future.isDone() && failureOf(publish.future) == null);
+    }
+  }
+
+  @VisibleForTesting
+  int pendingPublishCount() {
+    int count = 0;
+    for (List<PendingPublish> publishes : pendingPublishes.values()) {
+      count += publishes.size();
+    }
+    return count;
+  }
+
+  /**
+   * Waits for the publishes and applies {@code behavior.on.error} to the ones that failed. Returns
+   * normally once every failure is handled, so that the offsets of the published records and of the
+   * failed ones can both be committed.
+   */
+  private void handlePublishResults(
+      List<PendingPublish> publishes, List<Future<Void>> deadLetterWrites) {
+    waitForAll(publishes);
+    List<PendingPublish> failed = new ArrayList<>();
+    for (PendingPublish publish : publishes) {
+      if (failureOf(publish.future) != null) {
+        failed.add(publish);
       }
+    }
+    if (failed.isEmpty()) {
+      return;
+    }
+
+    // An error that is not specific to one record stops the task before any record is skipped.
+    // So does running out of retries: Pub/Sub was unavailable or throttling, nothing was wrong with
+    // the records, and the restarted task publishes them again from the last committed offset.
+    for (PendingPublish publish : failed) {
+      Throwable error = failureOf(publish.future);
+      PublishFailure failure = classify(publish, error);
+      if (failure == PublishFailure.FATAL || failure == PublishFailure.OUT_OF_RETRIES) {
+        throw fatal(publish, error);
+      }
+    }
+
+    // A failed publish pauses its ordering key in the publisher, which then cancels every later
+    // message with that key until the key is resumed.
+    Set<String> pausedOrderingKeys = new HashSet<>();
+    for (PendingPublish publish : failed) {
+      String orderingKey = publish.message.getOrderingKey();
+      if (!orderingKey.isEmpty() && pausedOrderingKeys.add(orderingKey)) {
+        publisher.resumePublish(orderingKey);
+      }
+    }
+
+    // Pub/Sub rejects a whole request for one bad message without saying which one, so every
+    // message in that request is handled the same way.
+    for (PendingPublish publish : failed) {
+      Throwable error = failureOf(publish.future);
+      handleFailedPublish(publish, failureReason(publish, error), error, deadLetterWrites);
+    }
+  }
+
+  private String failureReason(PendingPublish publish, Throwable error) {
+    PublishFailure failure = classify(publish, error);
+    switch (failure) {
+      case INVALID_MESSAGE:
+        return "Pub/Sub rejected the publish request this record was sent in, which can hold up to "
+            + maxBufferSize
+            + " messages; this record may not be the one at fault: "
+            + describe(error);
+      case CANCELLED:
+        return "it was not sent because an earlier message with the same ordering key failed";
+      default:
+        // Fatal failures and running out of retries stop the task before records are handled.
+        throw new IllegalStateException("No record-level reason for a " + failure + " failure");
+    }
+  }
+
+  private void handleFailedPublish(
+      PendingPublish publish, String reason, Throwable error, List<Future<Void>> deadLetterWrites) {
+    Future<Void> deadLetterWrite = handleFailedRecord(publish.record, reason, error);
+    if (deadLetterWrite != null) {
+      deadLetterWrites.add(deadLetterWrite);
+    }
+  }
+
+  /**
+   * Applies {@code behavior.on.error} to a record that could not be published. Returns the dead
+   * letter queue write, or null if the record was not sent to the dead letter queue.
+   */
+  private Future<Void> handleFailedRecord(SinkRecord record, String reason, Throwable error) {
+    String message =
+        "Failed to publish " + describe(record) + " to " + fullTopicName + ": " + reason;
+    switch (behaviorOnError) {
+      case LOG:
+        if (reporter == null) {
+          log.warn(message + ". No dead letter queue is configured, so the record is skipped.");
+          return null;
+        }
+        log.warn(message + ". Sending the record to the dead letter queue.");
+        // Report the record exactly as the worker passed it, so that the worker writes the original
+        // bytes and tracks the write under the topic partition the record was consumed from.
+        return reporter.report(record, new DataException(message, error));
+      case IGNORE:
+        log.debug(message + ". Skipping the record.", error);
+        return null;
+      default:
+        throw new DataException(message, error);
+    }
+  }
+
+  private ConnectException fatal(PendingPublish publish, Throwable error) {
+    String reason =
+        classify(publish, error) == PublishFailure.OUT_OF_RETRIES
+            ? "publishing still failed after retrying for up to "
+                + CloudPubSubSinkConnector.MAX_TOTAL_TIMEOUT_MS
+                + "="
+                + maxTotalTimeoutMs
+                + " ms ("
+                + CloudPubSubSinkConnector.RETRY_BACKOFF_MS
+                + "="
+                + retryBackoffMs
+                + "): "
+                + describe(error)
+                + ". The error is not specific to this record, so the task is stopping; when it"
+                + " restarts, it publishes again from the last committed offset."
+            : describe(error)
+                + ". The error is not specific to this record, so the task is stopping.";
+    return new ConnectException(
+        "Failed to publish " + describe(publish.record) + " to " + fullTopicName + ": " + reason,
+        error);
+  }
+
+  /** Describes where a record came from, without any of its data. */
+  private String describe(SinkRecord record) {
+    TopicPartition partition = originalTopicPartition(record);
+    long offset = originalTopicSupported ? record.originalKafkaOffset() : record.kafkaOffset();
+    return "the record at topic "
+        + partition.topic()
+        + ", partition "
+        + partition.partition()
+        + ", offset "
+        + offset;
+  }
+
+  /** Describes a publish error, starting with its gRPC code if it has one. */
+  static String describe(Throwable error) {
+    if (!(error instanceof ApiException)) {
+      return error.toString();
+    }
+    // The cause is the gRPC error, whose message is the code and Pub/Sub's description.
+    String code = ((ApiException) error).getStatusCode().getCode().toString();
+    Throwable cause = error.getCause() != null ? error.getCause() : error;
+    String description = cause.getMessage() == null ? "" : cause.getMessage();
+    return description.startsWith(code) ? description : code + ": " + description;
+  }
+
+  private static PublishFailure classify(PendingPublish publish, Throwable error) {
+    if (error instanceof CancellationException) {
+      // The publisher cancels a message only when an earlier one with the same ordering key failed.
+      // Any other cancellation is unexpected, so it stops the task.
+      return publish.message.getOrderingKey().isEmpty()
+          ? PublishFailure.FATAL
+          : PublishFailure.CANCELLED;
+    }
+    if (error instanceof ApiException) {
+      ApiException apiError = (ApiException) error;
+      if (apiError.getStatusCode().getCode() == StatusCode.Code.INVALID_ARGUMENT) {
+        return PublishFailure.INVALID_MESSAGE;
+      }
+      if (apiError.isRetryable()) {
+        return PublishFailure.OUT_OF_RETRIES;
+      }
+    }
+    return PublishFailure.FATAL;
+  }
+
+  /** Returns the error a completed publish failed with, or null if it succeeded. */
+  private static Throwable failureOf(ApiFuture<String> future) {
+    try {
+      future.get();
+      return null;
+    } catch (ExecutionException e) {
+      return e.getCause() != null ? e.getCause() : e;
+    } catch (CancellationException e) {
+      return e;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new ConnectException("Interrupted while waiting for publishes to Cloud Pub/Sub", e);
+    }
+  }
+
+  /** Waits until every publish has completed, successfully or not. */
+  private static void waitForAll(List<PendingPublish> publishes) {
+    List<ApiFuture<String>> futures = new ArrayList<>();
+    for (PendingPublish publish : publishes) {
+      futures.add(publish.future);
+    }
+    try {
+      ApiFutures.successfulAsList(futures).get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new ConnectException("Interrupted while waiting for publishes to Cloud Pub/Sub", e);
+    } catch (ExecutionException e) {
+      throw new ConnectException("Failed to wait for publishes to Cloud Pub/Sub", e);
+    }
+  }
+
+  /**
+   * Waits for the dead letter queue writes made during flush(). The worker only waits for the ones
+   * made during put(), and an offset must not be committed for a record that reached neither
+   * Pub/Sub nor the dead letter queue.
+   */
+  private static void waitForDeadLetterWrites(List<Future<Void>> deadLetterWrites) {
+    for (Future<Void> deadLetterWrite : deadLetterWrites) {
       try {
-        ApiFutures.allAsList(outstandingFutures.futures).get();
-      } catch (Exception e) {
-        throw new RuntimeException(e);
-      } finally {
-        outstandingFutures.futures.clear();
+        deadLetterWrite.get();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new ConnectException("Interrupted while writing to the dead letter queue", e);
+      } catch (ExecutionException e) {
+        throw new ConnectException(
+            "Failed to write a record to the dead letter queue", e.getCause());
       }
     }
-    allOutstandingFutures.clear();
   }
 
-  /** Publish all the messages in a partition and store the Future's for each publish request. */
-  private void publishMessage(String topic, Integer partition, PubsubMessage message) {
-    addPendingMessageFuture(topic, partition, publisher.publish(message));
+  /** Publishes a message and keeps it until flush() handles the result. */
+  private void publishMessage(SinkRecord record, PubsubMessage message) {
+    PendingPublish publish = new PendingPublish(record, message, publisher.publish(message));
+    pendingPublishes
+        .computeIfAbsent(originalTopicPartition(record), partition -> new ArrayList<>())
+        .add(publish);
   }
 
-  private void addPendingMessageFuture(String topic, Integer partition, ApiFuture<String> future) {
-    // Get a map containing all futures per partition for the passed in topic.
-    Map<Integer, OutstandingFuturesForPartition> outstandingFuturesForTopic =
-        allOutstandingFutures.get(topic);
-    if (outstandingFuturesForTopic == null) {
-      outstandingFuturesForTopic = new HashMap<>();
-      allOutstandingFutures.put(topic, outstandingFuturesForTopic);
+  /**
+   * Returns the topic partition the worker commits the record's offset for: the one the record was
+   * consumed from, before any SMT changed it. Connect before 3.6 does not expose it, so this falls
+   * back to the record's own topic partition there.
+   */
+  private TopicPartition originalTopicPartition(SinkRecord record) {
+    if (originalTopicSupported) {
+      try {
+        return new TopicPartition(record.originalTopic(), record.originalKafkaPartition());
+      } catch (NoSuchMethodError e) {
+        originalTopicSupported = false;
+      }
     }
-    // Get the object containing the outstanding futures for this topic and partition..
-    OutstandingFuturesForPartition outstandingFutures = outstandingFuturesForTopic.get(partition);
-    if (outstandingFutures == null) {
-      outstandingFutures = new OutstandingFuturesForPartition();
-      outstandingFuturesForTopic.put(partition, outstandingFutures);
-    }
-    outstandingFutures.futures.add(future);
+    return new TopicPartition(record.topic(), record.kafkaPartition());
   }
 
   private void createPublisher() {
@@ -529,18 +846,7 @@ public class CloudPubSubSinkTask extends SinkTask {
     com.google.cloud.pubsub.v1.Publisher.Builder builder =
         com.google.cloud.pubsub.v1.Publisher.newBuilder(fullTopic)
             .setBatchingSettings(batchingSettings.build())
-            .setRetrySettings(
-                RetrySettings.newBuilder()
-                    // All values that are not configurable come from the defaults for the publisher
-                    // client library.
-                    .setTotalTimeout(Duration.ofMillis(maxTotalTimeoutMs))
-                    .setMaxRpcTimeout(Duration.ofMillis(maxRequestTimeoutMs))
-                    .setInitialRetryDelay(Duration.ofMillis(5))
-                    .setRetryDelayMultiplier(2)
-                    .setMaxRetryDelay(Duration.ofMillis(Long.MAX_VALUE))
-                    .setInitialRpcTimeout(Duration.ofSeconds(10))
-                    .setRpcTimeoutMultiplier(2)
-                    .build())
+            .setRetrySettings(buildRetrySettings())
             .setExecutorProvider(FixedExecutorProvider.create(getSystemExecutor()));
 
     // Configure endpoint, credentials and channel based on whether we're using emulator or
@@ -569,6 +875,25 @@ public class CloudPubSubSinkTask extends SinkTask {
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
+  }
+
+  @VisibleForTesting
+  RetrySettings buildRetrySettings() {
+    return RetrySettings.newBuilder()
+        // The other values that are not configurable come from the defaults of earlier versions of
+        // the publisher client library.
+        .setTotalTimeout(Duration.ofMillis(maxTotalTimeoutMs))
+        .setMaxRpcTimeout(Duration.ofMillis(maxRequestTimeoutMs))
+        .setInitialRetryDelay(Duration.ofMillis(retryBackoffMs))
+        .setRetryDelayMultiplier(2)
+        // Without a cap, the waits double until one can outlast an outage that has already ended,
+        // or the rest of the total timeout.
+        .setMaxRetryDelay(
+            Duration.ofMillis(
+                Math.max(CloudPubSubSinkConnector.MAX_RETRY_DELAY_MS, retryBackoffMs)))
+        .setInitialRpcTimeout(Duration.ofSeconds(10))
+        .setRpcTimeoutMultiplier(2)
+        .build();
   }
 
   private boolean useFlowControl() {
